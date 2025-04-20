@@ -44,6 +44,9 @@ class PioreactorAnalysis(param.Parameterized):
         self.od_plot = pn.pane.HoloViews(sizing_mode='stretch_width', height=250)
         self.time_plot = pn.pane.HoloViews(sizing_mode='stretch_width', height=250)
         
+        # Status pane for notifications fallback
+        self.status_pane = pn.pane.Markdown("")
+        
         # Stats output
         self.stats_output = pn.pane.HTML("")
         
@@ -56,6 +59,7 @@ class PioreactorAnalysis(param.Parameterized):
         # Main layout
         self.main_layout = pn.Column(
             pn.pane.Markdown("# Pioreactor Dilution Rate Analysis"),
+            self.status_pane,  # Add status pane for notifications
             pn.Row(
                 pn.Column(
                     pn.pane.Markdown("### Settings"),
@@ -86,6 +90,31 @@ class PioreactorAnalysis(param.Parameterized):
             )
         )
     
+    def show_notification(self, message, level="info"):
+        """Safe way to show notifications with fallback to status pane"""
+        # Print to console always (for debugging)
+        print(f"{level.upper()}: {message}")
+        
+        # Try Panel notifications API if available
+        try:
+            if hasattr(pn.state, 'notifications') and pn.state.notifications is not None:
+                notification_method = getattr(pn.state.notifications, level, None)
+                if notification_method:
+                    notification_method(message)
+                    return
+        except Exception:
+            pass
+            
+        # Fallback to status pane
+        color_map = {
+            "info": "blue",
+            "success": "green",
+            "warning": "orange",
+            "error": "red"
+        }
+        color = color_map.get(level, "black")
+        self.status_pane.object = f"<div style='color: {color}; padding: 10px; border-left: 4px solid {color};'>{message}</div>"
+
     def _upload_file_callback(self, event):
         """Handle file upload event"""
         if self.file_input.value is not None and self.file_input.filename.endswith('.csv'):
@@ -103,11 +132,11 @@ class PioreactorAnalysis(param.Parameterized):
                 self._update_plots()
                 
                 # Show success message
-                pn.state.notifications.success(f"File {self.file_input.filename} uploaded successfully!")
+                self.show_notification(f"File {self.file_input.filename} uploaded successfully!", "success")
             except Exception as e:
-                pn.state.notifications.error(f"Error processing file: {str(e)}")
+                self.show_notification(f"Error processing file: {str(e)}", "error")
         else:
-            pn.state.notifications.warning("Please upload a CSV file.")
+            self.show_notification("Please upload a CSV file.", "warning")
     
     def _process_data(self, df):
         """Process the uploaded CSV data"""
@@ -398,7 +427,22 @@ class PioreactorAnalysis(param.Parameterized):
         time_plot = time_plot.opts(tools=['tap'])
         time_plot.opts(hooks=[self._create_tap_callback(time_plot)])
         
-        # Update plot panes
+        # Create a shared range for all plots
+        shared_x_range = None
+
+        # Link the x-ranges for synchronized zooming
+        dilution_plot = dilution_plot.opts(shared_axes=True)
+        od_plot = od_plot.opts(shared_axes=True)
+        time_plot = time_plot.opts(shared_axes=True)
+
+        # Create a layout of all plots for linking
+        linked_layout = pn.Column(
+            self.dilution_plot.object,
+            self.od_plot.object, 
+            self.time_plot.object
+        ).servable()
+
+        # Now assign plots to their respective panes
         self.dilution_plot.object = dilution_plot
         self.od_plot.object = od_plot
         self.time_plot.object = time_plot
