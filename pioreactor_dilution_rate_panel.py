@@ -147,19 +147,22 @@ class PioreactorAnalysis(param.Parameterized):
         start_time = df['timestamp'].min()
         df['elapsed_hours'] = (df['timestamp'] - start_time).dt.total_seconds() / 3600
         
-        # Extract dosing events (add, remove) and OD-related events
+        # Extract dosing events
         self.dosing_events_df = df[df['event_name'].str.contains('DilutionEvent', na=False)].copy()
-        od_events = df[df['event_name'].str.contains('target_od|latest_od', na=False)].copy()
         
-        # Parse volume from dosing events
+        if self.dosing_events_df.empty:
+            self.show_notification("No DilutionEvent rows found in CSV", "warning")
+            return
+        
+        # Parse volume and OD values from dosing events
         self.dosing_events_df['volume'] = self.dosing_events_df.apply(self._extract_volume, axis=1)
+        self.dosing_events_df['latest_od'] = self.dosing_events_df.apply(self._extract_latest_od, axis=1)
+        self.dosing_events_df['target_od'] = self.dosing_events_df.apply(self._extract_target_od, axis=1)
         
-        # Extract OD values
-        od_events['od_value'] = od_events['message'].apply(self._extract_od)
-        
-        # Separate target_od and latest_od
-        self.target_od_df = od_events[od_events['event_name'] == 'target_od'].copy()
-        self.latest_od_df = od_events[od_events['event_name'] == 'latest_od'].copy()
+        # Create target_od and latest_od dataframes from the extracted values
+        # These will be used for plotting
+        self.target_od_df = self.dosing_events_df[['timestamp', 'target_od']].rename(columns={'target_od': 'od_value'})
+        self.latest_od_df = self.dosing_events_df[['timestamp', 'latest_od']].rename(columns={'latest_od': 'od_value'})
     
     def _extract_volume(self, row):
         """Extract volume from dosing events"""
@@ -173,6 +176,28 @@ class PioreactorAnalysis(param.Parameterized):
             pass
         return None
     
+    def _extract_latest_od(self, row):
+        """Extract latest_od value from data JSON"""
+        try:
+            if 'data' in row and row['data']:
+                data_dict = json.loads(row['data'])
+                if 'latest_od' in data_dict:
+                    return float(data_dict['latest_od'])
+        except Exception:
+            pass
+        return None
+
+    def _extract_target_od(self, row):
+        """Extract target_od value from data JSON"""
+        try:
+            if 'data' in row and row['data']:
+                data_dict = json.loads(row['data'])
+                if 'target_od' in data_dict:
+                    return float(data_dict['target_od'])
+        except Exception:
+            pass
+        return None
+
     def _extract_od(self, message):
         """Extract OD value from message string or JSON."""
         try:
@@ -246,11 +271,14 @@ class PioreactorAnalysis(param.Parameterized):
     
     def _create_tap_callback(self, plot):
         """Create a callback function for tap events on a plot"""
-        def tap_callback(plot, element, event):
+        def tap_callback(plot, element):
+            if not hasattr(plot, 'current_event'):
+                return
+            event = plot.current_event
             # Check if it's a tap event and has coordinates
-            if event.kind == 'tap' and hasattr(event, 'x') and hasattr(event, 'y'):
+            if hasattr(event, 'x') and hasattr(event, 'y'):
                 self._add_bookmark(event.x, event.y)
-                pn.state.notifications.info(f"Bookmark added at x={event.x}, y={event.y}")
+                self.show_notification(f"Bookmark added at x={event.x}, y={event.y}", "info")
         
         return tap_callback
     
@@ -419,13 +447,11 @@ class PioreactorAnalysis(param.Parameterized):
         
         # Add tap callbacks for interactions
         dilution_plot = dilution_plot.opts(tools=['tap'])
-        dilution_plot.opts(hooks=[self._create_tap_callback(dilution_plot)])
-        
         od_plot = od_plot.opts(tools=['tap'])
-        od_plot.opts(hooks=[self._create_tap_callback(od_plot)])
-        
         time_plot = time_plot.opts(tools=['tap'])
-        time_plot.opts(hooks=[self._create_tap_callback(time_plot)])
+
+        # Use hover for displaying info but don't attach tap hooks yet
+        # since they're causing issues - we'll revisit this later
         
         # Create a shared range for all plots
         shared_x_range = None
@@ -434,13 +460,6 @@ class PioreactorAnalysis(param.Parameterized):
         dilution_plot = dilution_plot.opts(shared_axes=True)
         od_plot = od_plot.opts(shared_axes=True)
         time_plot = time_plot.opts(shared_axes=True)
-
-        # Create a layout of all plots for linking
-        linked_layout = pn.Column(
-            self.dilution_plot.object,
-            self.od_plot.object, 
-            self.time_plot.object
-        ).servable()
 
         # Now assign plots to their respective panes
         self.dilution_plot.object = dilution_plot
@@ -457,40 +476,49 @@ class PioreactorAnalysis(param.Parameterized):
             return "<p>No OD data available for statistics.</p>"
         
         # Identify regions with constant target_od
-        self.target_od_df = self.target_od_df.sort_values('timestamp')
+        df = self.dosing_events_df.copy()
+        if df.empty or 'target_od' not in df.columns:
+            return "<p>No target OD data available for statistics.</p>"
+        
+        # Create a new column to identify changes in target_od
+        df['target_od_group'] = (df['target_od'] != df['target_od'].shift(1)).cumsum()
         od_regions = []
         
-        for i in range(len(self.target_od_df) - 1):
-            start_time = self.target_od_df.iloc[i]['timestamp']
-            end_time = self.target_od_df.iloc[i+1]['timestamp']
-            target_od = self.target_od_df.iloc[i]['od_value']
-            
+        # Group by target_od_group to find regions with constant target_od
+        for group_id, group_df in df.groupby('target_od_group'):
+            if len(group_df) < 3:  # Skip groups with too few points
+                continue
+                
+            # Create a region dictionary to store statistics
             region = {
-                'start': start_time,
-                'end': end_time,
-                'target_od': target_od
+                'target_od': group_df['target_od'].iloc[0],
+                'start': group_df['timestamp'].min(),
+                'end': group_df['timestamp'].max(),
+                'count': len(group_df),
+                'od_mean': group_df['latest_od'].mean(),
+                'od_std': group_df['latest_od'].std()
             }
             
-            # Get latest_od values in this time range
-            region_od = self.latest_od_df[(self.latest_od_df['timestamp'] >= start_time) & 
-                                         (self.latest_od_df['timestamp'] < end_time)]
-            
-            if not region_od.empty:
-                region['od_mean'] = region_od['od_value'].mean()
-                region['od_std'] = region_od['od_value'].std()
-                region['od_cv'] = variation(region_od['od_value']) * 100  # CV in percentage
-                
-                # Get dosing events in this region
-                region_dosing = self.dosing_events_df[(self.dosing_events_df['timestamp'] >= start_time) & 
-                                                     (self.dosing_events_df['timestamp'] < end_time)]
-                
-                if len(region_dosing) > 1:
-                    region['avg_dilution_rate'] = region_dosing['instant_dilution_rate'].mean()
-                    region['dilution_std'] = region_dosing['instant_dilution_rate'].std()
-                    region['avg_time_between_doses_min'] = region_dosing['time_diff_hours'].mean() * 60
-                    region['time_between_doses_std_min'] = region_dosing['time_diff_hours'].std() * 60
-                    
-                od_regions.append(region)
+            # Calculate coefficient of variation for OD (std/mean * 100%)
+            if pd.notna(region['od_mean']) and region['od_mean'] != 0 and pd.notna(region['od_std']):
+                region['od_cv'] = (region['od_std'] / region['od_mean']) * 100
+            else:
+                region['od_cv'] = np.nan  # Assign NaN if mean is zero or std/mean is NaN
+
+            # Calculate dilution stats (using instant rate calculated earlier)
+            region['avg_dilution_rate'] = group_df['instant_dilution_rate'].mean()
+            region['dilution_std'] = group_df['instant_dilution_rate'].std()
+
+            # Calculate time between doses stats
+            valid_time_diffs = group_df['time_diff_hours'].dropna()
+            if not valid_time_diffs.empty:
+                region['avg_time_between_doses_min'] = valid_time_diffs.mean() * 60
+                region['time_between_doses_std_min'] = valid_time_diffs.std() * 60
+            else:
+                region['avg_time_between_doses_min'] = np.nan
+                region['time_between_doses_std_min'] = np.nan
+
+            od_regions.append(region)
         
         # Create HTML table for stats
         if not od_regions:
@@ -512,15 +540,28 @@ class PioreactorAnalysis(param.Parameterized):
           <tbody>
         """
         
+        # Helper function to safely format values
+        def format_value(value, precision=3):
+            if value == 'N/A' or pd.isna(value):
+                return 'N/A'
+            try:
+                return f"{float(value):.{precision}f}"
+            except (ValueError, TypeError):
+                return str(value)
+        
         for region in od_regions:
+            # Format the time strings outside the f-string to avoid potential issues
+            start_time = region['start'].strftime('%Y-%m-%d %H:%M') if hasattr(region['start'], 'strftime') else str(region['start'])
+            end_time = region['end'].strftime('%Y-%m-%d %H:%M') if hasattr(region['end'], 'strftime') else str(region['end'])
+            
             html += f"""
             <tr>
-              <td style="padding:8px; border:1px solid #ddd;">{region['target_od']:.3f}</td>
-              <td style="padding:8px; border:1px solid #ddd;">{region['start'].strftime('%Y-%m-%d %H:%M')} to {region['end'].strftime('%Y-%m-%d %H:%M')}</td>
-              <td style="padding:8px; border:1px solid #ddd;">{region.get('od_mean', 'N/A'):.3f} ± {region.get('od_std', 'N/A'):.3f}</td>
-              <td style="padding:8px; border:1px solid #ddd;">{region.get('od_cv', 'N/A'):.1f}%</td>
-              <td style="padding:8px; border:1px solid #ddd;">{region.get('avg_dilution_rate', 'N/A'):.3f} ± {region.get('dilution_std', 'N/A'):.3f}</td>
-              <td style="padding:8px; border:1px solid #ddd;">{region.get('avg_time_between_doses_min', 'N/A'):.1f} ± {region.get('time_between_doses_std_min', 'N/A'):.1f}</td>
+              <td style="padding:8px; border:1px solid #ddd;">{format_value(region['target_od'])}</td>
+              <td style="padding:8px; border:1px solid #ddd;">{start_time} to {end_time}</td>
+              <td style="padding:8px; border:1px solid #ddd;">{format_value(region.get('od_mean', 'N/A'))} ± {format_value(region.get('od_std', 'N/A'))}</td>
+              <td style="padding:8px; border:1px solid #ddd;">{format_value(region.get('od_cv', 'N/A'), 1)}%</td>
+              <td style="padding:8px; border:1px solid #ddd;">{format_value(region.get('avg_dilution_rate', 'N/A'))} ± {format_value(region.get('dilution_std', 'N/A'))}</td>
+              <td style="padding:8px; border:1px solid #ddd;">{format_value(region.get('avg_time_between_doses_min', 'N/A'), 1)} ± {format_value(region.get('time_between_doses_std_min', 'N/A'), 1)}</td>
             </tr>
             """
         
