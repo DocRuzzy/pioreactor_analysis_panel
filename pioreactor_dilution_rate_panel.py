@@ -282,13 +282,54 @@ class PioreactorAnalysis(param.Parameterized):
         # Extract dosing events (DilutionEvent)
         self.dosing_events_df = df[df['event_name'].str.contains('dilution', case=False, na=False)].copy()
         
+        if self.dosing_events_df.empty:
+            print("Warning: No dilution events found in the data.")
+            return
+        
         # Extract OD data using the specialized approach
         self._extract_od_data_specialized(df)
         
-        # Parse volume from dosing events
-        if not self.dosing_events_df.empty:
-            self.dosing_events_df['volume'] = self.dosing_events_df.apply(self._extract_volume, axis=1)
-    
+        # Parse volume from dosing events with debugging
+        print(f"\nFound {len(self.dosing_events_df)} dilution events")
+        
+        # Sample events before extraction to check format
+        print("\nSample events before volume extraction:")
+        sample_data = self.dosing_events_df[['timestamp', 'data', 'message']].head(2)
+        for _, row in sample_data.iterrows():
+            print(f"Timestamp: {row['timestamp']}")
+            print(f"Data: {row['data']}")
+            print(f"Message: {row['message']}")
+            print("---")
+        
+        # Apply volume extraction
+        self.dosing_events_df['volume'] = self.dosing_events_df.apply(self._extract_volume, axis=1)
+        self.dosing_events_df['volume'] = pd.to_numeric(self.dosing_events_df['volume'], errors='coerce')
+        
+        # Show statistics about extracted volumes
+        extracted_count = self.dosing_events_df['volume'].notna().sum()
+        print(f"\nSuccessfully extracted volumes for {extracted_count}/{len(self.dosing_events_df)} events ({extracted_count/len(self.dosing_events_df)*100:.1f}%)")
+        
+        unique_volumes = sorted(self.dosing_events_df['volume'].dropna().unique())
+        print(f"Unique volume values found: {unique_volumes}")
+        
+        # Check for volume changes
+        self.dosing_events_df.sort_values('timestamp', inplace=True)
+        self.dosing_events_df['volume_changed'] = self.dosing_events_df['volume'] != self.dosing_events_df['volume'].shift(1)
+        
+        # Sample of first few events with volumes
+        volume_sample = self.dosing_events_df.head(5)[['timestamp', 'volume']]
+        print("\nSample of first few events with extracted volumes:")
+        print(volume_sample)
+        
+        # Show where volume changes occur
+        volume_changes = self.dosing_events_df[self.dosing_events_df['volume_changed'] == True].copy()
+        if not volume_changes.empty:
+            print(f"\nDetected {len(volume_changes)} volume changes. First few changes:")
+            changes_sample = volume_changes[['timestamp', 'volume']].head(5)
+            print(changes_sample)
+        else:
+            print("\nNo volume changes detected in the data.")
+        
     def _extract_od_data_specialized(self, df):
         """
         Specialized extraction method based on the format of the provided data.
@@ -410,27 +451,57 @@ class PioreactorAnalysis(param.Parameterized):
             The extracted volume value, or None if not found/parseable
         """
         try:
-            # Try data column first
+            # Try data column first (JSON format)
             if 'data' in row and pd.notna(row['data']):
                 try:
                     data_dict = json.loads(row['data'])
                     if 'volume' in data_dict:
-                        return float(data_dict['volume'])
-                except:
-                    pass
+                        volume_value = float(data_dict['volume'])
+                        return volume_value
+                except json.JSONDecodeError as e:
+                    print(f"JSON decode error for data: {row['data'][:50]}... Error: {e}")
+                except Exception as e:
+                    print(f"Error extracting volume from data: {e}")
             
-            # Try message column
+            # Try message column as fallback
             if 'message' in row and pd.notna(row['message']):
-                # Look for patterns like "volume: 0.5 mL" or "added 0.5 mL" or "cycled 0.5 mL"
-                match = re.search(r'(?:volume|added|removed|cycled)[:\s]+([0-9.]+)\s*m?L', 
-                                 str(row['message']), re.IGNORECASE)
-                if match:
-                    return float(match.group(1))
-        except Exception:
-            pass
+                # Look for patterns like "cycled 0.50 mL"
+                patterns = [
+                    r'cycled\s+([0-9.]+)\s*mL',                              # "cycled X mL" pattern
+                    r'(?:volume|added|removed|cycled)[:\s]+([0-9.]+)\s*m?L',  # General pattern
+                    r'([0-9.]+)\s*m?L',                                      # Just a number followed by mL
+                ]
+                
+                for pattern in patterns:
+                    match = re.search(pattern, str(row['message']), re.IGNORECASE)
+                    if match:
+                        volume_value = float(match.group(1))
+                        print(f"Extracted volume {volume_value} from message text using pattern: {pattern}")
+                        return volume_value
+        except Exception as e:
+            print(f"Unexpected error extracting volume: {e}")
         
         return None
-    
+        
+    def _calculate_volume_changes(self):
+        """Detect points where cycled volumes change"""
+        # Make sure volumes are numeric
+        if 'volume' not in self.dosing_events_df.columns:
+            return pd.DataFrame()
+        
+        # Detect points where volume changes compared to previous point
+        self.dosing_events_df['volume_change'] = self.dosing_events_df['volume'] != self.dosing_events_df['volume'].shift(1)
+        
+        # Get rows where volume changes occur
+        volume_change_df = self.dosing_events_df[self.dosing_events_df['volume_change'] == True].copy()
+        
+        # Debug output
+        if not volume_change_df.empty:
+            print("\nDEBUG - VOLUME CHANGES DETECTED:")
+            print(volume_change_df[['timestamp', 'volume', 'capped_time_diff']].head(10))
+        
+        return volume_change_df
+        
     def _update_callback(self, event):
         """
         Handle update button click events.
@@ -549,9 +620,26 @@ class PioreactorAnalysis(param.Parameterized):
         Generates dilution rate plots, OD value plots, and time between doses plots.
         Also calculates statistics and links the plots for synchronized interactions.
         """
-        # Create plots individually first
-        self._update_dilution_plots()
-        self._update_od_plots()
+        # Check if we have data
+        if self.dosing_events_df.empty or not all(col in self.dosing_events_df.columns for col in ['timestamp', 'volume']):
+            # Display empty placeholders
+            self.dilution_plot.object = hv.Text(0, 0, 'No valid dosing data found').opts(width=800, height=300)
+            self.od_plot.object = hv.Text(0, 0, 'No valid OD data found').opts(width=800, height=250)
+            self.time_plot.object = hv.Text(0, 0, 'No valid time data found').opts(width=800, height=250)
+            self.stats_output.object = "<p>No data available for plotting or statistics.</p>"
+            return
+        
+        # Update plots individually 
+        dilution_plot = self._update_dilution_plots()
+        od_plot = self._update_od_plots()
+        time_plot = self._update_time_plots()  # Our new method with volume markers
+        
+        # Link plots for synchronized zooming/panning (if needed)
+        # This part depends on how your current linking code works
+        
+        # Update statistics
+        stats_html = self._calculate_stats()
+        self.stats_output.object = stats_html
 
     
     def _format_time_ticks(self, reference_time=None):
@@ -903,6 +991,132 @@ class PioreactorAnalysis(param.Parameterized):
                 self.od_plot.object = hv.Text(0, 0, 'No OD data available').opts(width=800, height=250)
         else:
             self.od_plot.object = hv.Text(0, 0, 'No OD data available').opts(width=800, height=250)
+
+    def _update_time_plots(self):
+        """Update the inter-dosing period plot with volume change markers"""
+        # Check if data exists
+        if self.dosing_events_df.empty or 'capped_time_diff' not in self.dosing_events_df.columns:
+            self.time_plot.object = hv.Text(0, 0, 'No Inter-Dosing Time data').opts(width=800, height=250)
+            return None
+        
+        # Get dataframes for normal points and outliers
+        plot_df_time = self.dosing_events_df.dropna(subset=['timestamp', 'capped_time_diff'])
+        
+        # Add volume change detection
+        if 'volume' in self.dosing_events_df.columns:
+            # Sort by timestamp to ensure correct order
+            sorted_df = self.dosing_events_df.sort_values('timestamp')
+            # Mark points where volume changes
+            sorted_df['volume_changed'] = sorted_df['volume'] != sorted_df['volume'].shift(1)
+            self.dosing_events_df = sorted_df
+        else:
+            # If no volume column, create empty flag
+            self.dosing_events_df['volume_changed'] = False
+        
+        # Split into normal and outlier points
+        if 'is_outlier' in self.dosing_events_df.columns:
+            normal_df = plot_df_time[~plot_df_time['is_outlier']]
+            outlier_df = plot_df_time[plot_df_time['is_outlier']]
+        else:
+            normal_df = plot_df_time
+            outlier_df = pd.DataFrame()  # Empty DataFrame if no outliers marked
+        
+        # Create plot components
+        time_plots_overlay = []
+        
+        # Add main time curve
+        if not plot_df_time.empty:
+            time_line = hv.Curve(
+                plot_df_time, 'timestamp', 'capped_time_diff', label='Minutes Between Doses'
+            ).opts(color='blue', line_width=1, tools=['hover'])
+            time_plots_overlay.append(time_line)
+        
+        # Add normal points
+        if not normal_df.empty:
+            normal_scatter = hv.Scatter(
+                normal_df, 'timestamp', 'capped_time_diff'
+            ).opts(color='blue', size=6, tools=['hover'])
+            time_plots_overlay.append(normal_scatter)
+        
+        # Add outlier points
+        if not outlier_df.empty:
+            outlier_scatter = hv.Scatter(
+                outlier_df, 'timestamp', 'capped_time_diff'
+            ).opts(color='red', marker='circle', size=8, tools=['hover'])
+            time_plots_overlay.append(outlier_scatter)
+        
+        # Add volume change markers
+        volume_change_df = self.dosing_events_df[
+            (self.dosing_events_df['volume_changed'] == True) & 
+            ~self.dosing_events_df['capped_time_diff'].isna()
+        ].copy()
+        
+        if not volume_change_df.empty:
+            # Add markers at volume change points
+            volume_markers = hv.Scatter(
+                volume_change_df,
+                'timestamp',
+                'capped_time_diff'
+            ).opts(
+                color='green',
+                size=12,
+                marker='triangle',
+                line_color='black',
+                line_width=1,
+                tools=['hover']
+            )
+            time_plots_overlay.append(volume_markers)
+            
+            # Add text labels showing the new volume
+            for idx, row in volume_change_df.iterrows():
+                if pd.notna(row['volume']):
+                    label = hv.Text(
+                        row['timestamp'], 
+                        min(row['capped_time_diff'] + 5, 60),  # Cap at 60 to stay in view
+                        f"Volume: {row['volume']} mL"
+                    ).opts(text_color='green', text_font_size='10pt', text_font_style='bold')
+                    time_plots_overlay.append(label)
+        
+        # Combine all plot elements
+        time_plot_combined = hv.Overlay(time_plots_overlay).opts(
+            legend_position='top_right',
+            xlabel='Time',
+            ylabel='Minutes Between Doses (capped at 60)',
+            title='Inter-Dosing Period (with Volume Change Markers)',
+            width=800,
+            height=250,
+            ylim=(0, 65)
+        ) if time_plots_overlay else hv.Text(0, 0, 'No Inter-Dosing Time data').opts(width=800, height=250)
+        
+        # Apply formatter safely
+        try:
+            # Try to get formatter and source, but handle different return patterns
+            format_result = self._format_time_ticks()
+            
+            # Check if result is a tuple (old style) or just a formatter (new style)
+            if isinstance(format_result, tuple) and len(format_result) == 2:
+                time_formatter, time_source = format_result
+            else:
+                # If not a tuple, assume it's just the formatter
+                time_formatter = format_result
+            
+            # Apply formatter to plot
+            def apply_time_formatter(plot, element):
+                try:
+                    plot.handles['xaxis'].formatter = time_formatter
+                except Exception as e:
+                    print(f"Error applying formatter: {e}")
+            
+            time_plot_combined = time_plot_combined.opts(
+                hooks=[apply_time_formatter],
+                tools=['pan', 'wheel_zoom', 'box_zoom', 'reset', 'tap']
+            )
+        except Exception as e:
+            print(f"Error setting time formatter: {e}")
+            # Continue without formatter if there's an error
+        
+        self.time_plot.object = time_plot_combined
+        return time_plot_combined
 
     def _calculate_stats(self):
         """
