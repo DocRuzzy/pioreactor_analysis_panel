@@ -1,6 +1,6 @@
 # app.py - Entry point for Hugging Face Spaces
 import panel as pn
-from pioreactor_panel import PioreactorAnalysis
+from pioreactor_dilution_rate_panel import PioreactorAnalysis
 
 # Initialize the application
 pioreactor_analysis = PioreactorAnalysis()
