@@ -23,7 +23,7 @@ import hvplot.pandas
 import holoviews as hv
 import panel as pn
 import param
-from bokeh.models import HoverTool
+from bokeh.models import CustomJSTickFormatter, HoverTool
 import json
 from scipy.stats import variation
 import uuid
@@ -52,12 +52,12 @@ class PioreactorAnalysis(param.Parameterized):
     reactor_volume : float
         Volume of the reactor in mL (default: 14.0)
     moving_avg_window : int
-        Number of events to include in moving average calculations (default: 5)
+        Number of events to include in moving average calculations (default: 30)
     """
     
     reactor_volume = param.Number(14.0, bounds=(1, 100), step=0.1, 
                                   doc="Reactor volume in mL")
-    moving_avg_window = param.Integer(5, bounds=(1, 50), step=1, 
+    moving_avg_window = param.Integer(30, bounds=(1, 50), step=1, 
                                       doc="Moving average window (# of events)")
     
     def __init__(self, **params):
@@ -252,6 +252,7 @@ class PioreactorAnalysis(param.Parameterized):
         else:
             self.show_warning("Please upload a CSV file.")
     
+
     def _process_data(self, df):
         """
         Process the uploaded CSV data for analysis.
@@ -264,12 +265,19 @@ class PioreactorAnalysis(param.Parameterized):
         df : pandas.DataFrame
             The raw data frame from the uploaded CSV file
         """
-        # Convert timestamps to datetime objects
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        # Convert timestamps to datetime objects (and normalize timezone)
+        df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_localize(None)
         
-        # Create elapsed time column (in hours)
-        start_time = df['timestamp'].min()
-        df['elapsed_hours'] = (df['timestamp'] - start_time).dt.total_seconds() / 3600
+        # Also convert the timestamp_localtime column if it exists
+        if 'timestamp_localtime' in df.columns:
+            df['timestamp_localtime'] = pd.to_datetime(df['timestamp_localtime']).dt.tz_localize(None)
+            # Use timestamp_localtime for elapsed time calculation
+            start_time = df['timestamp_localtime'].min()
+            df['elapsed_hours'] = (df['timestamp_localtime'] - start_time).dt.total_seconds() / 3600
+        else:
+            # Fallback to timestamp if timestamp_localtime doesn't exist
+            start_time = df['timestamp'].min()
+            df['elapsed_hours'] = (df['timestamp'] - start_time).dt.total_seconds() / 3600
         
         # Extract dosing events (DilutionEvent)
         self.dosing_events_df = df[df['event_name'].str.contains('dilution', case=False, na=False)].copy()
@@ -306,6 +314,9 @@ class PioreactorAnalysis(param.Parameterized):
         
         # Process each row that may contain OD information
         for idx, row in df.iterrows():
+            # Use timestamp_localtime if available, otherwise use timestamp
+            timestamp_to_use = row['timestamp_localtime'] if 'timestamp_localtime' in row and pd.notna(row['timestamp_localtime']) else row['timestamp']
+            
             # Try to extract from data JSON field (most reliable)
             if pd.notna(row.get('data')) and isinstance(row['data'], str):
                 try:
@@ -315,7 +326,7 @@ class PioreactorAnalysis(param.Parameterized):
                     if 'target_od' in data_dict and isinstance(data_dict['target_od'], (int, float)):
                         target_od_value = float(data_dict['target_od'])
                         target_od_data.append({
-                            'timestamp': row['timestamp'],
+                            'timestamp': timestamp_to_use,
                             'od_value': target_od_value
                         })
                         data_json_count += 1
@@ -325,7 +336,7 @@ class PioreactorAnalysis(param.Parameterized):
                     if 'latest_od' in data_dict and isinstance(data_dict['latest_od'], (int, float)):
                         latest_od_value = float(data_dict['latest_od'])
                         latest_od_data.append({
-                            'timestamp': row['timestamp'],
+                            'timestamp': timestamp_to_use,
                             'od_value': latest_od_value
                         })
                         data_json_count += 1
@@ -340,7 +351,7 @@ class PioreactorAnalysis(param.Parameterized):
                 if latest_match:
                     latest_od_value = float(latest_match.group(1))
                     latest_od_data.append({
-                        'timestamp': row['timestamp'],
+                        'timestamp': timestamp_to_use,
                         'od_value': latest_od_value
                     })
                     message_regex_count += 1
@@ -351,7 +362,7 @@ class PioreactorAnalysis(param.Parameterized):
                 if target_match:
                     target_od_value = float(target_match.group(1))
                     target_od_data.append({
-                        'timestamp': row['timestamp'],
+                        'timestamp': timestamp_to_use,
                         'od_value': target_od_value
                     })
                     message_regex_count += 1
@@ -381,8 +392,9 @@ class PioreactorAnalysis(param.Parameterized):
         
         # Show detailed OD extraction info in debug tab
         self.show_debug("OD Data Extraction:\n" + "\n".join(debug_info[:50]) + 
-                       ("\n..." if len(debug_info) > 50 else ""))
-    
+                    ("\n..." if len(debug_info) > 50 else ""))
+        
+
     def _extract_volume(self, row):
         """
         Extract volume information from dosing events.
@@ -481,8 +493,10 @@ class PioreactorAnalysis(param.Parameterized):
         
         bookmark_cards = []
         for bm in self.bookmarks:
-            # Format timestamp for display
-            if isinstance(bm['timestamp'], pd.Timestamp):
+            # Use time_display if available, otherwise format the timestamp
+            if 'time_display' in bm:
+                time_str = bm['time_display']
+            elif isinstance(bm['timestamp'], pd.Timestamp):
                 time_str = bm['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
             else:
                 time_str = str(bm['timestamp'])
@@ -496,7 +510,7 @@ class PioreactorAnalysis(param.Parameterized):
                 pn.pane.Markdown(f"**Time:** {time_str}"),
                 pn.pane.Markdown(f"**Value:** {bm['value']:.3f}"),
                 pn.widgets.Button(name="Copy Data", button_type='default', 
-                                 on_click=lambda event, bm=bm: self.show_success(f"Copied: Time: {bm['timestamp']}, Value: {bm['value']}")),
+                                 on_click=lambda event, bm=bm: self.show_success(f"Copied: Time: {time_str}, Value: {bm['value']}")),
                 title=bm['label'],
                 collapsed=False
             )
@@ -535,10 +549,8 @@ class PioreactorAnalysis(param.Parameterized):
         Generates dilution rate plots, OD value plots, and time between doses plots.
         Also calculates statistics and links the plots for synchronized interactions.
         """
-        # Update dilution and timing plots
+        # Create plots individually first
         self._update_dilution_plots()
-        
-        # Update OD plots
         self._update_od_plots()
         
         # Calculate statistics
@@ -554,7 +566,14 @@ class PioreactorAnalysis(param.Parameterized):
             return
         
         # Sort by timestamp
-        self.dosing_events_df = self.dosing_events_df.sort_values('timestamp')
+        if 'timestamp_localtime' in self.dosing_events_df.columns:
+            self.dosing_events_df = self.dosing_events_df.sort_values('timestamp_localtime')
+            # Store start time for axis formatting
+            start_time = self.dosing_events_df['timestamp_localtime'].min()
+        else:
+            self.dosing_events_df = self.dosing_events_df.sort_values('timestamp')
+            # Store start time for axis formatting
+            start_time = self.dosing_events_df['timestamp'].min()
         
         # Filter out rows with missing volume
         self.dosing_events_df = self.dosing_events_df[pd.notna(self.dosing_events_df['volume'])]
@@ -564,10 +583,22 @@ class PioreactorAnalysis(param.Parameterized):
             self.time_plot.object = hv.Text(0, 0, 'Insufficient dilution events to calculate rates').opts(width=800, height=250)
             return
         
+        # Ensure elapsed_hours column exists 
+        if 'elapsed_hours' not in self.dosing_events_df.columns:
+            if 'timestamp_localtime' in self.dosing_events_df.columns:
+                self.dosing_events_df['elapsed_hours'] = (self.dosing_events_df['timestamp_localtime'] - start_time).dt.total_seconds() / 3600
+            else:
+                self.dosing_events_df['elapsed_hours'] = (self.dosing_events_df['timestamp'] - start_time).dt.total_seconds() / 3600
+        
         # Calculate time between doses
-        self.dosing_events_df['next_timestamp'] = self.dosing_events_df['timestamp'].shift(-1)
-        self.dosing_events_df['time_diff_hours'] = (self.dosing_events_df['next_timestamp'] - 
-                                                  self.dosing_events_df['timestamp']).dt.total_seconds() / 3600
+        if 'timestamp_localtime' in self.dosing_events_df.columns:
+            self.dosing_events_df['next_timestamp'] = self.dosing_events_df['timestamp_localtime'].shift(-1)
+            self.dosing_events_df['time_diff_hours'] = (self.dosing_events_df['next_timestamp'] - 
+                                                    self.dosing_events_df['timestamp_localtime']).dt.total_seconds() / 3600
+        else:
+            self.dosing_events_df['next_timestamp'] = self.dosing_events_df['timestamp'].shift(-1)
+            self.dosing_events_df['time_diff_hours'] = (self.dosing_events_df['next_timestamp'] - 
+                                                    self.dosing_events_df['timestamp']).dt.total_seconds() / 3600
         
         # Calculate instant dilution rate (with safety check for division by zero)
         self.dosing_events_df['instant_dilution_rate'] = np.where(
@@ -586,10 +617,10 @@ class PioreactorAnalysis(param.Parameterized):
             .mean()
         )
         
-        # HoloViews plots with tooltips
+        # HoloViews plots with tooltips - using elapsed_hours for consistency
         dilution_scatter = hv.Scatter(
             self.dosing_events_df, 
-            'timestamp', 
+            'elapsed_hours', 
             'instant_dilution_rate',
             label='Instant Dilution Rate'
         ).opts(
@@ -603,7 +634,7 @@ class PioreactorAnalysis(param.Parameterized):
         
         dilution_line = hv.Curve(
             self.dosing_events_df, 
-            'timestamp', 
+            'elapsed_hours', 
             'moving_avg_dilution_rate',
             label=f'Moving Avg ({self.moving_avg_window} events)'
         ).opts(
@@ -621,10 +652,10 @@ class PioreactorAnalysis(param.Parameterized):
         normal_df = self.dosing_events_df[~self.dosing_events_df['is_outlier']]
         outlier_df = self.dosing_events_df[self.dosing_events_df['is_outlier']]
         
-        # Time between doses plot
+        # Time between doses plot - using elapsed_hours for x-axis
         time_line = hv.Curve(
             self.dosing_events_df,
-            'timestamp',
+            'elapsed_hours',
             'capped_time_diff',
             label='Minutes Between Doses'
         ).opts(
@@ -639,7 +670,7 @@ class PioreactorAnalysis(param.Parameterized):
         
         normal_scatter = hv.Scatter(
             normal_df,
-            'timestamp',
+            'elapsed_hours',
             'capped_time_diff'
         ).opts(
             color='blue',
@@ -651,7 +682,7 @@ class PioreactorAnalysis(param.Parameterized):
         
         outlier_scatter = hv.Scatter(
             outlier_df,
-            'timestamp',
+            'elapsed_hours',
             'capped_time_diff'
         ).opts(
             color='red',
@@ -662,16 +693,44 @@ class PioreactorAnalysis(param.Parameterized):
             height=250
         )
         
-        # Combine plots
+        # Use a ticker with improved date handling for timestamp_localtime
+        ticker_formatter = CustomJSTickFormatter(code="""
+        function format_tick(tick) {
+            var hours = Math.floor(tick);
+            var minutes = Math.floor((tick - hours) * 60);
+            
+            // Parse start time using ISO format for better compatibility
+            var start_str = "%s";
+            var start_parts = start_str.split(/[- :]/);
+            var start_ts = new Date(
+                parseInt(start_parts[0]),                 // year
+                parseInt(start_parts[1]) - 1,             // month (JS months are 0-based)
+                parseInt(start_parts[2]),                 // day
+                parseInt(start_parts[3] || 0),            // hour (default to 0 if missing)
+                parseInt(start_parts[4] || 0),            // minute
+                parseInt(start_parts[5] || 0)             // second
+            );
+            
+            // Calculate new timestamp by adding elapsed hours
+            var ts = new Date(start_ts.getTime() + tick * 60 * 60 * 1000);
+            var date_str = (ts.getMonth() + 1) + '/' + ts.getDate() + ' ' + 
+                        String(ts.getHours()).padStart(2, '0') + ':' + 
+                        String(ts.getMinutes()).padStart(2, '0');
+            
+            return hours + "h " + minutes + "m\\n" + date_str;
+        }
+        """ % start_time.strftime('%Y-%m-%d %H:%M:%S'))
+        
+        # Combine plots with the custom formatter
         dilution_plot = (dilution_scatter * dilution_line).opts(
             legend_position='top_right',
-            xlabel='Time',
+            xlabel='Time (elapsed hours / date)',
             ylabel='Dilution Rate (h⁻¹)'
         )
         
         time_plot = (time_line * normal_scatter * outlier_scatter).opts(
             legend_position='top_right',
-            xlabel='Time',
+            xlabel='Time (elapsed hours / date)',
             ylabel='Minutes Between Doses',
             ylim=(0, 65)
         )
@@ -683,7 +742,20 @@ class PioreactorAnalysis(param.Parameterized):
         time_plot = time_plot.opts(tools=['tap'])
         time_plot.opts(hooks=[self._create_tap_callback(time_plot)])
         
-        # Update dilution plot panes
+        # Define a function to set the x-axis formatter
+        def set_xaxis_formatter(plot, element):
+            plot.handles['xaxis'].formatter = ticker_formatter
+        
+        # Update plot panes with custom axis formatting
+        dilution_plot = dilution_plot.opts(
+            hooks=[set_xaxis_formatter]
+        )
+        
+        time_plot = time_plot.opts(
+            hooks=[set_xaxis_formatter]
+        )
+        
+        # Update plot panes
         self.dilution_plot.object = dilution_plot
         self.time_plot.object = time_plot
     
@@ -695,32 +767,83 @@ class PioreactorAnalysis(param.Parameterized):
         has_target_od = not self.target_od_df.empty and 'od_value' in self.target_od_df.columns
         has_latest_od = not self.latest_od_df.empty and 'od_value' in self.latest_od_df.columns
         
-        # Debug info
-        debug_info = f"OD Plotting:\n"
-        debug_info += f"Target OD data available: {has_target_od}\n"
-        debug_info += f"Latest OD data available: {has_latest_od}\n"
+        # Determine start time - use consistent start time across all plots
+        if not self.dosing_events_df.empty:
+            # Prioritize timestamp_localtime if available
+            if 'timestamp_localtime' in self.dosing_events_df.columns:
+                start_time = self.dosing_events_df['timestamp_localtime'].min()
+            else:
+                start_time = self.dosing_events_df['timestamp'].min()
+        elif has_target_od:
+            # Prioritize timestamp_localtime if available
+            if 'timestamp_localtime' in self.target_od_df.columns:
+                start_time = self.target_od_df['timestamp_localtime'].min()
+            else:
+                start_time = self.target_od_df['timestamp'].min()
+        elif has_latest_od:
+            # Prioritize timestamp_localtime if available
+            if 'timestamp_localtime' in self.latest_od_df.columns:
+                start_time = self.latest_od_df['timestamp_localtime'].min()
+            else:
+                start_time = self.latest_od_df['timestamp'].min()
+        else:
+            # No data available
+            self.od_plot.object = hv.Text(0, 0, 'No OD data available').opts(width=800, height=250)
+            return
+        
+        # Create the ticker formatter with improved date handling
+        ticker_formatter = CustomJSTickFormatter(code="""
+        function format_tick(tick) {
+            var hours = Math.floor(tick);
+            var minutes = Math.floor((tick - hours) * 60);
+            
+            // Parse start time using ISO format for better compatibility
+            var start_str = "%s";
+            var start_parts = start_str.split(/[- :]/);
+            var start_ts = new Date(
+                parseInt(start_parts[0]),                 // year
+                parseInt(start_parts[1]) - 1,             // month (JS months are 0-based)
+                parseInt(start_parts[2]),                 // day
+                parseInt(start_parts[3] || 0),            // hour (default to 0 if missing)
+                parseInt(start_parts[4] || 0),            // minute
+                parseInt(start_parts[5] || 0)             // second
+            );
+            
+            // Calculate new timestamp by adding elapsed hours
+            var ts = new Date(start_ts.getTime() + tick * 60 * 60 * 1000);
+            var date_str = (ts.getMonth() + 1) + '/' + ts.getDate() + ' ' + 
+                        String(ts.getHours()).padStart(2, '0') + ':' + 
+                        String(ts.getMinutes()).padStart(2, '0');
+            
+            return hours + "h " + minutes + "m\\n" + date_str;
+        }
+        """ % start_time.strftime('%Y-%m-%d %H:%M:%S'))
         
         if has_target_od or has_latest_od:
             # Process target OD data
             if has_target_od:
-                # Sort and clean target OD data
-                self.target_od_df = self.target_od_df.sort_values('timestamp')
+                # Add elapsed_hours column based on timestamp_localtime if available
+                if 'timestamp_localtime' in self.target_od_df.columns:
+                    self.target_od_df['elapsed_hours'] = (self.target_od_df['timestamp_localtime'] - start_time).dt.total_seconds() / 3600
+                    # Sort target OD data
+                    self.target_od_df = self.target_od_df.sort_values('timestamp_localtime')
+                else:
+                    self.target_od_df['elapsed_hours'] = (self.target_od_df['timestamp'] - start_time).dt.total_seconds() / 3600
+                    # Sort target OD data
+                    self.target_od_df = self.target_od_df.sort_values('timestamp')
+                
+                # Clean target OD data
                 self.target_od_df = self.target_od_df[
                     pd.notna(self.target_od_df['od_value']) & 
                     (self.target_od_df['od_value'] >= 0) &
                     (self.target_od_df['od_value'] < 10)  # Assuming OD > 10 is an error
                 ]
                 
-                debug_info += f"Target OD rows after cleaning: {len(self.target_od_df)}\n"
+                # Create target OD plot using elapsed_hours
                 if not self.target_od_df.empty:
-                    debug_info += f"Target OD range: {self.target_od_df['od_value'].min():.3f} - {self.target_od_df['od_value'].max():.3f}\n"
-                
-                # Create target OD plot
-                if not self.target_od_df.empty:
-                    debug_info += f"Creating target OD plot with {len(self.target_od_df)} points\n"
                     target_od = hv.Curve(
                         self.target_od_df,
-                        'timestamp',
+                        'elapsed_hours',  # Use elapsed_hours
                         'od_value',
                         label='Target OD'
                     ).opts(
@@ -731,28 +854,31 @@ class PioreactorAnalysis(param.Parameterized):
                         height=250
                     )
                     od_plots.append(target_od)
-                    debug_info += "Target OD plot added successfully\n"
             
             # Process latest OD data
             if has_latest_od:
-                # Sort and clean latest OD data
-                self.latest_od_df = self.latest_od_df.sort_values('timestamp')
+                # Add elapsed_hours column based on timestamp_localtime if available
+                if 'timestamp_localtime' in self.latest_od_df.columns:
+                    self.latest_od_df['elapsed_hours'] = (self.latest_od_df['timestamp_localtime'] - start_time).dt.total_seconds() / 3600
+                    # Sort latest OD data
+                    self.latest_od_df = self.latest_od_df.sort_values('timestamp_localtime')
+                else:
+                    self.latest_od_df['elapsed_hours'] = (self.latest_od_df['timestamp'] - start_time).dt.total_seconds() / 3600
+                    # Sort latest OD data
+                    self.latest_od_df = self.latest_od_df.sort_values('timestamp')
+                
+                # Clean latest OD data
                 self.latest_od_df = self.latest_od_df[
                     pd.notna(self.latest_od_df['od_value']) & 
                     (self.latest_od_df['od_value'] >= 0) &
                     (self.latest_od_df['od_value'] < 10)  # Assuming OD > 10 is an error
                 ]
                 
-                debug_info += f"Latest OD rows after cleaning: {len(self.latest_od_df)}\n"
+                # Create latest OD plot using elapsed_hours
                 if not self.latest_od_df.empty:
-                    debug_info += f"Latest OD range: {self.latest_od_df['od_value'].min():.3f} - {self.latest_od_df['od_value'].max():.3f}\n"
-                
-                # Create latest OD plot
-                if not self.latest_od_df.empty:
-                    debug_info += f"Creating latest OD plot with {len(self.latest_od_df)} points\n"
                     latest_od = hv.Curve(
                         self.latest_od_df,
-                        'timestamp',
+                        'elapsed_hours',  # Use elapsed_hours
                         'od_value',
                         label='Latest OD'
                     ).opts(
@@ -762,14 +888,12 @@ class PioreactorAnalysis(param.Parameterized):
                         height=250
                     )
                     od_plots.append(latest_od)
-                    debug_info += "Latest OD plot added successfully\n"
             
             # Create combined OD plot
             if od_plots:
-                debug_info += f"Creating combined OD plot with {len(od_plots)} curves\n"
                 od_plot = hv.Overlay(od_plots).opts(
                     legend_position='top_right',
-                    xlabel='Time',
+                    xlabel='Time (elapsed hours / date)',
                     ylabel='OD Value',
                     title='OD Values'
                 )
@@ -778,18 +902,22 @@ class PioreactorAnalysis(param.Parameterized):
                 od_plot = od_plot.opts(tools=['tap'])
                 od_plot.opts(hooks=[self._create_tap_callback(od_plot)])
                 
+                # Define a function to set the x-axis formatter
+                def set_xaxis_formatter(plot, element):
+                    plot.handles['xaxis'].formatter = ticker_formatter
+                
+                # Add custom formatter to x-axis
+                od_plot = od_plot.opts(
+                    hooks=[set_xaxis_formatter]
+                )
+                
+                # Update plot pane
                 self.od_plot.object = od_plot
-                debug_info += "Combined OD plot created successfully\n"
             else:
-                self.od_plot.object = hv.Text(0, 0, 'No valid OD data available').opts(width=800, height=250)
-                debug_info += "No valid OD data available for plotting\n"
+                self.od_plot.object = hv.Text(0, 0, 'No OD data available').opts(width=800, height=250)
         else:
             self.od_plot.object = hv.Text(0, 0, 'No OD data available').opts(width=800, height=250)
-            debug_info += "No OD data available for plotting\n"
-        
-        # Update debug info
-        self.show_debug(debug_info)
-    
+
     def _calculate_stats(self):
         """
         Calculate statistics for different target_od regions.
