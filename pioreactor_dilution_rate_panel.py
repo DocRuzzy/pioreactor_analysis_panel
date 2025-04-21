@@ -23,7 +23,7 @@ import hvplot.pandas
 import holoviews as hv
 import panel as pn
 import param
-from bokeh.models import CustomJSTickFormatter, HoverTool
+from bokeh.models import CustomJSTickFormatter, ColumnDataSource, HoverTool
 import json
 from scipy.stats import variation
 import uuid
@@ -552,11 +552,46 @@ class PioreactorAnalysis(param.Parameterized):
         # Create plots individually first
         self._update_dilution_plots()
         self._update_od_plots()
-        
-        # Calculate statistics
-        stats_html = self._calculate_stats()
-        self.stats_output.object = stats_html
+
     
+    def _format_time_ticks(self, reference_time=None):
+        # reference_time: a pd.Timestamp
+        if reference_time is None:
+            if self.dosing_events_df.empty:
+                min_time = pd.Timestamp.now()
+            else:
+                min_time = self.dosing_events_df['timestamp'].min()
+        else:
+            min_time = reference_time
+
+        if hasattr(min_time, 'tz') and min_time.tz is not None:
+            min_time = min_time.tz_localize(None)
+        min_time_ms = int(min_time.timestamp() * 1000)
+
+        source = ColumnDataSource(data={'start_time_ms': [min_time_ms]})
+
+        code = """
+            // tick is elapsed_hours (float)
+            const start_time_ms = source.data.start_time_ms[0];
+            const tick_ms = start_time_ms + tick * 3600 * 1000;
+            const date = new Date(tick_ms);
+
+            // Format date as MM/DD HH:MM
+            const monthDay = (date.getMonth() + 1).toString().padStart(2, '0') + '/' +
+                            date.getDate().toString().padStart(2, '0');
+            const timeStr = date.getHours().toString().padStart(2, '0') + ':' +
+                            date.getMinutes().toString().padStart(2, '0');
+
+            // Format elapsed hours
+            const elapsed = tick.toFixed(1);
+
+            return `${monthDay} ${timeStr}\\n(${elapsed}h)`;
+        """
+
+        formatter = CustomJSTickFormatter(code=code, args={'source': source})
+        return formatter
+
+
     def _update_dilution_plots(self):
         """Update dilution rate and timing plots"""
         if self.dosing_events_df.empty:
@@ -693,33 +728,8 @@ class PioreactorAnalysis(param.Parameterized):
             height=250
         )
         
-        # Use a ticker with improved date handling for timestamp_localtime
-        ticker_formatter = CustomJSTickFormatter(code="""
-        function format_tick(tick) {
-            var hours = Math.floor(tick);
-            var minutes = Math.floor((tick - hours) * 60);
-            
-            // Parse start time using ISO format for better compatibility
-            var start_str = "%s";
-            var start_parts = start_str.split(/[- :]/);
-            var start_ts = new Date(
-                parseInt(start_parts[0]),                 // year
-                parseInt(start_parts[1]) - 1,             // month (JS months are 0-based)
-                parseInt(start_parts[2]),                 // day
-                parseInt(start_parts[3] || 0),            // hour (default to 0 if missing)
-                parseInt(start_parts[4] || 0),            // minute
-                parseInt(start_parts[5] || 0)             // second
-            );
-            
-            // Calculate new timestamp by adding elapsed hours
-            var ts = new Date(start_ts.getTime() + tick * 60 * 60 * 1000);
-            var date_str = (ts.getMonth() + 1) + '/' + ts.getDate() + ' ' + 
-                        String(ts.getHours()).padStart(2, '0') + ':' + 
-                        String(ts.getMinutes()).padStart(2, '0');
-            
-            return hours + "h " + minutes + "m\\n" + date_str;
-        }
-        """ % start_time.strftime('%Y-%m-%d %H:%M:%S'))
+        # Use the new formatting method with the start_time
+        formatter = self._format_time_ticks(reference_time=start_time)
         
         # Combine plots with the custom formatter
         dilution_plot = (dilution_scatter * dilution_line).opts(
@@ -744,7 +754,7 @@ class PioreactorAnalysis(param.Parameterized):
         
         # Define a function to set the x-axis formatter
         def set_xaxis_formatter(plot, element):
-            plot.handles['xaxis'].formatter = ticker_formatter
+            plot.handles['xaxis'].formatter = formatter  # Apply only the formatter
         
         # Update plot panes with custom axis formatting
         dilution_plot = dilution_plot.opts(
@@ -758,6 +768,7 @@ class PioreactorAnalysis(param.Parameterized):
         # Update plot panes
         self.dilution_plot.object = dilution_plot
         self.time_plot.object = time_plot
+    
     
     def _update_od_plots(self):
         """Update OD plots with both target and latest OD values"""
@@ -791,33 +802,8 @@ class PioreactorAnalysis(param.Parameterized):
             self.od_plot.object = hv.Text(0, 0, 'No OD data available').opts(width=800, height=250)
             return
         
-        # Create the ticker formatter with improved date handling
-        ticker_formatter = CustomJSTickFormatter(code="""
-        function format_tick(tick) {
-            var hours = Math.floor(tick);
-            var minutes = Math.floor((tick - hours) * 60);
-            
-            // Parse start time using ISO format for better compatibility
-            var start_str = "%s";
-            var start_parts = start_str.split(/[- :]/);
-            var start_ts = new Date(
-                parseInt(start_parts[0]),                 // year
-                parseInt(start_parts[1]) - 1,             // month (JS months are 0-based)
-                parseInt(start_parts[2]),                 // day
-                parseInt(start_parts[3] || 0),            // hour (default to 0 if missing)
-                parseInt(start_parts[4] || 0),            // minute
-                parseInt(start_parts[5] || 0)             // second
-            );
-            
-            // Calculate new timestamp by adding elapsed hours
-            var ts = new Date(start_ts.getTime() + tick * 60 * 60 * 1000);
-            var date_str = (ts.getMonth() + 1) + '/' + ts.getDate() + ' ' + 
-                        String(ts.getHours()).padStart(2, '0') + ':' + 
-                        String(ts.getMinutes()).padStart(2, '0');
-            
-            return hours + "h " + minutes + "m\\n" + date_str;
-        }
-        """ % start_time.strftime('%Y-%m-%d %H:%M:%S'))
+        # Use the new formatting method with the start_time
+        formatter = self._format_time_ticks(reference_time=start_time)
         
         if has_target_od or has_latest_od:
             # Process target OD data
@@ -904,7 +890,7 @@ class PioreactorAnalysis(param.Parameterized):
                 
                 # Define a function to set the x-axis formatter
                 def set_xaxis_formatter(plot, element):
-                    plot.handles['xaxis'].formatter = ticker_formatter
+                    plot.handles['xaxis'].formatter = formatter  # Apply only the formatter
                 
                 # Add custom formatter to x-axis
                 od_plot = od_plot.opts(
