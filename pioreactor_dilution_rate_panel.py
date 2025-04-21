@@ -13,7 +13,7 @@ Features:
 - User bookmarking system for points of interest
 - Customizable parameters (reactor volume, moving average window)
 
-Author: Russell Kirk Pirlo with Claude Copilot
+Author: Russell Kirk Pirlo Improved by Claude
 Date: April 21, 2025
 """
 
@@ -210,6 +210,14 @@ class PioreactorAnalysis(param.Parameterized):
                 debug_info += f"Columns: {cols_info}\n"
                 debug_info += f"Event types: {events_info}\n"
                 
+                # Sample data rows for debugging
+                debug_info += "\nSample rows:\n"
+                for i, row in df.head(3).iterrows():
+                    debug_info += f"Row {i}:\n"
+                    debug_info += f"  event_name: {row.get('event_name', 'N/A')}\n"
+                    debug_info += f"  message: {row.get('message', 'N/A')}\n"
+                    debug_info += f"  data: {row.get('data', 'N/A')}\n"
+                
                 # Process the data
                 self._process_data(df)
                 
@@ -220,9 +228,14 @@ class PioreactorAnalysis(param.Parameterized):
                 debug_info += f"Latest OD events: {len(self.latest_od_df)} rows\n"
                 
                 if not self.latest_od_df.empty and 'od_value' in self.latest_od_df.columns:
-                    debug_info += f"OD values: {self.latest_od_df['od_value'].min():.3f} - {self.latest_od_df['od_value'].max():.3f}\n"
+                    debug_info += f"Latest OD values: {self.latest_od_df['od_value'].min():.3f} - {self.latest_od_df['od_value'].max():.3f}\n"
                     sample_values = self.latest_od_df['od_value'].head(5).tolist()
-                    debug_info += f"Sample OD values: {sample_values}\n"
+                    debug_info += f"Sample Latest OD values: {sample_values}\n"
+                
+                if not self.target_od_df.empty and 'od_value' in self.target_od_df.columns:
+                    debug_info += f"Target OD values: {self.target_od_df['od_value'].min():.3f} - {self.target_od_df['od_value'].max():.3f}\n"
+                    sample_values = self.target_od_df['od_value'].head(5).tolist()
+                    debug_info += f"Sample Target OD values: {sample_values}\n"
                 
                 self.show_debug(debug_info)
                 
@@ -258,109 +271,121 @@ class PioreactorAnalysis(param.Parameterized):
         start_time = df['timestamp'].min()
         df['elapsed_hours'] = (df['timestamp'] - start_time).dt.total_seconds() / 3600
         
-        # Extract dosing events and OD-related events
-        # Look for more general event names related to dilution and OD
+        # Extract dosing events (DilutionEvent)
         self.dosing_events_df = df[df['event_name'].str.contains('dilution', case=False, na=False)].copy()
         
-        # More flexible approach to get OD events
-        target_od_mask = df['event_name'].str.contains('target', case=False, na=False) & df['event_name'].str.contains('od', case=False, na=False)
-        latest_od_mask = df['event_name'].str.contains('latest', case=False, na=False) & df['event_name'].str.contains('od', case=False, na=False)
-        
-        # If no specific OD events, look for any OD-related events
-        if not target_od_mask.any() and not latest_od_mask.any():
-            od_events = df[df['event_name'].str.contains('od', case=False, na=False)].copy()
-            # Try to infer target vs latest from message or data
-            for idx, row in od_events.iterrows():
-                if 'target' in str(row['message']).lower() or 'target' in str(row['data']).lower():
-                    target_od_mask.loc[idx] = True
-                elif 'latest' in str(row['message']).lower() or 'latest' in str(row['data']).lower():
-                    latest_od_mask.loc[idx] = True
-                else:
-                    # Default to latest if can't determine
-                    latest_od_mask.loc[idx] = True
-        else:
-            od_events = df[target_od_mask | latest_od_mask].copy()
+        # Extract OD data using the specialized approach
+        self._extract_od_data_specialized(df)
         
         # Parse volume from dosing events
         if not self.dosing_events_df.empty:
             self.dosing_events_df['volume'] = self.dosing_events_df.apply(self._extract_volume, axis=1)
-        
-        # Extract OD values with enhanced debugging
-        od_extraction_details = []
-        
-        for idx, row in od_events.iterrows():
-            od_value, details = self._extract_od_with_details(row['message'], row['data'])
-            od_events.loc[idx, 'od_value'] = od_value
-            od_extraction_details.append(f"Row {idx}: {details}")
-        
-        # Log detailed OD extraction
-        self.show_debug("\nOD extraction details:\n" + "\n".join(od_extraction_details[:10]) + 
-                       ("\n..." if len(od_extraction_details) > 10 else ""))
-        
-        # Separate target_od and latest_od using the masks
-        self.target_od_df = od_events[target_od_mask].copy() if target_od_mask.any() else pd.DataFrame()
-        self.latest_od_df = od_events[latest_od_mask].copy() if latest_od_mask.any() else pd.DataFrame()
-        
-        # If we still don't have OD events, look for it in different columns or try different parsing
-        if (self.target_od_df.empty and self.latest_od_df.empty) or 'od_value' not in od_events.columns:
-            self.show_warning("Could not find OD data in expected format. Trying alternative methods...")
-            self._try_alternative_od_parsing(df)
     
-    def _try_alternative_od_parsing(self, df):
+    def _extract_od_data_specialized(self, df):
         """
-        Try alternative methods to parse OD data if standard methods fail.
+        Specialized extraction method based on the format of the provided data.
+        
+        This method assumes both latest_od and target_od values might be in the same row,
+        either in the data JSON field or in the message field.
         
         Parameters
         ----------
         df : pandas.DataFrame
             The raw data frame
         """
-        # Method 1: Look for any numeric values in message that could be OD
-        od_candidates = []
+        # Initialize empty dataframes for target and latest OD
+        target_od_data = []
+        latest_od_data = []
         
+        # Debug collection
+        debug_info = []
+        
+        # Count of rows processed for each method
+        data_json_count = 0
+        message_regex_count = 0
+        
+        # Process each row that may contain OD information
         for idx, row in df.iterrows():
-            message = str(row['message'])
-            # Look for patterns like "OD: 0.123" or "OD = 0.456"
-            matches = re.findall(r'OD[:\s=]+([0-9.]+)', message, re.IGNORECASE)
-            if matches:
-                od_candidates.append({
-                    'timestamp': row['timestamp'],
-                    'event_name': 'latest_od',  # Default to latest
-                    'od_value': float(matches[0])
-                })
+            # Try to extract from data JSON field (most reliable)
+            if pd.notna(row.get('data')) and isinstance(row['data'], str):
+                try:
+                    data_dict = json.loads(row['data'])
+                    
+                    # Extract target_od if available
+                    if 'target_od' in data_dict and isinstance(data_dict['target_od'], (int, float)):
+                        target_od_value = float(data_dict['target_od'])
+                        target_od_data.append({
+                            'timestamp': row['timestamp'],
+                            'od_value': target_od_value
+                        })
+                        data_json_count += 1
+                        debug_info.append(f"Row {idx}: Found target_od = {target_od_value} in data JSON")
+                    
+                    # Extract latest_od if available
+                    if 'latest_od' in data_dict and isinstance(data_dict['latest_od'], (int, float)):
+                        latest_od_value = float(data_dict['latest_od'])
+                        latest_od_data.append({
+                            'timestamp': row['timestamp'],
+                            'od_value': latest_od_value
+                        })
+                        data_json_count += 1
+                        debug_info.append(f"Row {idx}: Found latest_od = {latest_od_value} in data JSON")
+                except Exception as e:
+                    debug_info.append(f"Row {idx}: Error parsing data JSON: {str(e)}")
+            
+            # As a fallback, try extracting from message field using regex
+            if pd.notna(row.get('message')) and isinstance(row['message'], str):
+                # Try to extract latest OD from message
+                latest_match = re.search(r'Latest\s*OD\s*=\s*([0-9.]+)', row['message'])
+                if latest_match:
+                    latest_od_value = float(latest_match.group(1))
+                    latest_od_data.append({
+                        'timestamp': row['timestamp'],
+                        'od_value': latest_od_value
+                    })
+                    message_regex_count += 1
+                    debug_info.append(f"Row {idx}: Found latest_od = {latest_od_value} from message regex")
+                
+                # Try to extract target OD from message
+                target_match = re.search(r'Target\s*OD\s*=\s*([0-9.]+)', row['message'])
+                if target_match:
+                    target_od_value = float(target_match.group(1))
+                    target_od_data.append({
+                        'timestamp': row['timestamp'],
+                        'od_value': target_od_value
+                    })
+                    message_regex_count += 1
+                    debug_info.append(f"Row {idx}: Found target_od = {target_od_value} from message regex")
         
-        if od_candidates:
-            self.latest_od_df = pd.DataFrame(od_candidates)
-            self.show_success(f"Found {len(od_candidates)} OD values using alternative parsing")
+        # Remove duplicates (same timestamp and value)
+        if target_od_data:
+            target_od_df = pd.DataFrame(target_od_data)
+            target_od_df = target_od_df.drop_duplicates(subset=['timestamp', 'od_value'])
+            self.target_od_df = target_od_df
         else:
-            # Method 2: Try parsing JSON in the data column
-            json_od_values = []
-            
-            for idx, row in df.iterrows():
-                if pd.notna(row.get('data')):
-                    try:
-                        data = json.loads(row['data'])
-                        # Look for fields that might contain OD values
-                        for key in ['od', 'OD', 'od_reading', 'od_value', 'latest_od']:
-                            if key in data and isinstance(data[key], (int, float)):
-                                json_od_values.append({
-                                    'timestamp': row['timestamp'],
-                                    'event_name': 'latest_od',
-                                    'od_value': float(data[key])
-                                })
-                                break
-                    except:
-                        pass  # Not valid JSON or doesn't contain OD
-            
-            if json_od_values:
-                self.latest_od_df = pd.DataFrame(json_od_values)
-                self.show_success(f"Found {len(json_od_values)} OD values from JSON data")
+            self.target_od_df = pd.DataFrame()
+        
+        if latest_od_data:
+            latest_od_df = pd.DataFrame(latest_od_data)
+            latest_od_df = latest_od_df.drop_duplicates(subset=['timestamp', 'od_value'])
+            self.latest_od_df = latest_od_df
+        else:
+            self.latest_od_df = pd.DataFrame()
+        
+        # Add summary to debug info
+        debug_info.insert(0, f"OD Data Extraction Summary:")
+        debug_info.insert(1, f"- Extracted {len(target_od_data)} target OD values and {len(latest_od_data)} latest OD values")
+        debug_info.insert(2, f"- JSON data extraction: {data_json_count} values")
+        debug_info.insert(3, f"- Message regex extraction: {message_regex_count} values")
+        debug_info.insert(4, f"- After deduplication: {len(self.target_od_df)} target OD and {len(self.latest_od_df)} latest OD values")
+        
+        # Show detailed OD extraction info in debug tab
+        self.show_debug("OD Data Extraction:\n" + "\n".join(debug_info[:50]) + 
+                       ("\n..." if len(debug_info) > 50 else ""))
     
     def _extract_volume(self, row):
         """
         Extract volume information from dosing events.
-        
-        Parses the JSON data column to extract volume values.
         
         Parameters
         ----------
@@ -375,93 +400,24 @@ class PioreactorAnalysis(param.Parameterized):
         try:
             # Try data column first
             if 'data' in row and pd.notna(row['data']):
-                data_dict = json.loads(row['data'])
-                if 'volume' in data_dict:
-                    return float(data_dict['volume'])
+                try:
+                    data_dict = json.loads(row['data'])
+                    if 'volume' in data_dict:
+                        return float(data_dict['volume'])
+                except:
+                    pass
             
             # Try message column
             if 'message' in row and pd.notna(row['message']):
-                # Look for patterns like "volume: 0.5 mL" or "added 0.5 mL"
-                match = re.search(r'(?:volume|added|removed)[:\s]+([0-9.]+)\s*m?L', 
+                # Look for patterns like "volume: 0.5 mL" or "added 0.5 mL" or "cycled 0.5 mL"
+                match = re.search(r'(?:volume|added|removed|cycled)[:\s]+([0-9.]+)\s*m?L', 
                                  str(row['message']), re.IGNORECASE)
                 if match:
                     return float(match.group(1))
-        except Exception as e:
-            # Just silently fail and return None
+        except Exception:
             pass
         
         return None
-    
-    def _extract_od_with_details(self, message, data):
-        """
-        Extract optical density (OD) values with detailed logging for debugging.
-        
-        Parameters
-        ----------
-        message : str
-            The message string containing OD information
-        data : str
-            The data string (usually JSON) that may contain OD information
-            
-        Returns
-        -------
-        tuple
-            (od_value, details_string) where od_value is the extracted value (or None)
-            and details_string contains information about the extraction process
-        """
-        try:
-            # Try parsing JSON from data column
-            if pd.notna(data) and isinstance(data, str):
-                try:
-                    data_dict = json.loads(data)
-                    if 'od' in data_dict:
-                        return float(data_dict['od']), f"Found in data JSON 'od': {data_dict['od']}"
-                    if 'latest_od' in data_dict:
-                        return float(data_dict['latest_od']), f"Found in data JSON 'latest_od': {data_dict['latest_od']}"
-                    
-                    # Log all keys in the JSON for debugging
-                    return None, f"Data JSON keys: {list(data_dict.keys())}, no OD found"
-                except:
-                    pass
-            
-            # Try parsing JSON from message
-            if pd.notna(message) and isinstance(message, str) and message.startswith('{'):
-                try:
-                    msg_dict = json.loads(message)
-                    if 'od' in msg_dict:
-                        return float(msg_dict['od']), f"Found in message JSON 'od': {msg_dict['od']}"
-                    if 'latest_od' in msg_dict:
-                        return float(msg_dict['latest_od']), f"Found in message JSON 'latest_od': {msg_dict['latest_od']}"
-                    
-                    # Log all keys in the JSON for debugging
-                    return None, f"Message JSON keys: {list(msg_dict.keys())}, no OD found"
-                except:
-                    pass
-            
-            # Try to extract OD value from message using regex
-            if pd.notna(message) and isinstance(message, str):
-                # Pattern 1: "Latest OD = 0.30"
-                match1 = re.search(r'(?:Latest|Target)\s*OD\s*=\s*([0-9.]+)', message)
-                if match1:
-                    return float(match1.group(1)), f"Regex pattern 1: {match1.group(1)} from '{message}'"
-                
-                # Pattern 2: "OD: 0.30"
-                match2 = re.search(r'OD[:\s=]+([0-9.]+)', message, re.IGNORECASE)
-                if match2:
-                    return float(match2.group(1)), f"Regex pattern 2: {match2.group(1)} from '{message}'"
-                
-                # Pattern 3: Any number that might be an OD
-                match3 = re.search(r'(?<!\d)([0-9]+\.[0-9]+)(?!\d)', message)
-                if match3:
-                    return float(match3.group(1)), f"Regex pattern 3: {match3.group(1)} from '{message}'"
-                
-                # Log the message for debugging
-                return None, f"No OD pattern match in: '{message}'"
-            
-            return None, "Message or data is null or not a string"
-        
-        except Exception as e:
-            return None, f"Error in extraction: {str(e)}"
     
     def _update_callback(self, event):
         """
@@ -564,7 +520,7 @@ class PioreactorAnalysis(param.Parameterized):
         function
             A callback function that adds bookmarks when points are tapped
         """
-        # Fixed callback signature to match what HoloViews expects
+        # Fixed callback signature for HoloViews 1.20.2
         def tap_callback(plot_id, element):
             if hasattr(plot_id, 'x') and hasattr(plot_id, 'y'):
                 self._add_bookmark(plot_id.x, plot_id.y)
@@ -579,163 +535,189 @@ class PioreactorAnalysis(param.Parameterized):
         Generates dilution rate plots, OD value plots, and time between doses plots.
         Also calculates statistics and links the plots for synchronized interactions.
         """
+        # Update dilution and timing plots
+        self._update_dilution_plots()
+        
+        # Update OD plots
+        self._update_od_plots()
+        
+        # Calculate statistics
+        stats_html = self._calculate_stats()
+        self.stats_output.object = stats_html
+    
+    def _update_dilution_plots(self):
+        """Update dilution rate and timing plots"""
         if self.dosing_events_df.empty:
             # No data to plot for dilution rate
             self.dilution_plot.object = hv.Text(0, 0, 'No dilution event data available').opts(width=800, height=300)
             self.time_plot.object = hv.Text(0, 0, 'No dilution event data available').opts(width=800, height=250)
-        else:
-            # Calculate dilution rate from dosing events
-            # Sort by timestamp
-            self.dosing_events_df = self.dosing_events_df.sort_values('timestamp')
-            
-            # Filter out rows with missing volume
-            self.dosing_events_df = self.dosing_events_df[pd.notna(self.dosing_events_df['volume'])]
-            
-            if len(self.dosing_events_df) <= 1:
-                self.dilution_plot.object = hv.Text(0, 0, 'Insufficient dilution events to calculate rates').opts(width=800, height=300)
-                self.time_plot.object = hv.Text(0, 0, 'Insufficient dilution events to calculate rates').opts(width=800, height=250)
-                self.stats_output.object = "<p>Insufficient data for analysis</p>"
-                return
-            
-            # Calculate time between doses
-            self.dosing_events_df['next_timestamp'] = self.dosing_events_df['timestamp'].shift(-1)
-            self.dosing_events_df['time_diff_hours'] = (self.dosing_events_df['next_timestamp'] - 
-                                                      self.dosing_events_df['timestamp']).dt.total_seconds() / 3600
-            
-            # Calculate instant dilution rate (with safety check for division by zero)
-            self.dosing_events_df['instant_dilution_rate'] = np.where(
-                self.dosing_events_df['time_diff_hours'] > 0,
-                self.dosing_events_df['volume'] / self.reactor_volume / self.dosing_events_df['time_diff_hours'],
-                np.nan
-            )
-            
-            # Drop NaN and infinite values for better plotting
-            self.dosing_events_df = self.dosing_events_df.replace([np.inf, -np.inf], np.nan).dropna(subset=['instant_dilution_rate'])
-            
-            # Calculate moving average of dilution rate
-            self.dosing_events_df['moving_avg_dilution_rate'] = (
-                self.dosing_events_df['instant_dilution_rate']
-                .rolling(window=self.moving_avg_window, min_periods=1)
-                .mean()
-            )
-            
-            # HoloViews plots with tooltips
-            dilution_scatter = hv.Scatter(
-                self.dosing_events_df, 
-                'timestamp', 
-                'instant_dilution_rate',
-                label='Instant Dilution Rate'
-            ).opts(
-                color='blue',
-                size=5,
-                tools=['hover'],
-                width=800,
-                height=300,
-                title='Dilution Rate'
-            )
-            
-            dilution_line = hv.Curve(
-                self.dosing_events_df, 
-                'timestamp', 
-                'moving_avg_dilution_rate',
-                label=f'Moving Avg ({self.moving_avg_window} events)'
-            ).opts(
-                color='red',
-                line_width=2,
-                width=800,
-                height=300
-            )
-            
-            # Calculate outlier threshold for time differences
-            self.dosing_events_df['capped_time_diff'] = np.minimum(self.dosing_events_df['time_diff_hours'] * 60, 60)
-            self.dosing_events_df['is_outlier'] = self.dosing_events_df['time_diff_hours'] * 60 > 60
-            
-            # Create a dataframe for normal points and outliers
-            normal_df = self.dosing_events_df[~self.dosing_events_df['is_outlier']]
-            outlier_df = self.dosing_events_df[self.dosing_events_df['is_outlier']]
-            
-            # Time between doses plot
-            time_line = hv.Curve(
-                self.dosing_events_df,
-                'timestamp',
-                'capped_time_diff',
-                label='Minutes Between Doses'
-            ).opts(
-                color='blue',
-                line_width=1,
-                width=800,
-                height=250,
-                title='Inter-Dosing Period',
-                ylabel='Minutes Between Doses (capped at 60)',
-                tools=['hover']
-            )
-            
-            normal_scatter = hv.Scatter(
-                normal_df,
-                'timestamp',
-                'capped_time_diff'
-            ).opts(
-                color='blue',
-                size=6,
-                tools=['hover'],
-                width=800,
-                height=250
-            )
-            
-            outlier_scatter = hv.Scatter(
-                outlier_df,
-                'timestamp',
-                'capped_time_diff'
-            ).opts(
-                color='red',
-                marker='circle',
-                size=8,
-                tools=['hover'],
-                width=800,
-                height=250
-            )
-            
-            # Combine plots
-            dilution_plot = (dilution_scatter * dilution_line).opts(
-                legend_position='top_right',
-                xlabel='Time',
-                ylabel='Dilution Rate (h⁻¹)'
-            )
-            
-            time_plot = (time_line * normal_scatter * outlier_scatter).opts(
-                legend_position='top_right',
-                xlabel='Time',
-                ylabel='Minutes Between Doses',
-                ylim=(0, 65)
-            )
-            
-            # Add tap callbacks for interactions
-            dilution_plot = dilution_plot.opts(tools=['tap'])
-            dilution_plot.opts(hooks=[self._create_tap_callback(dilution_plot)])
-            
-            time_plot = time_plot.opts(tools=['tap'])
-            time_plot.opts(hooks=[self._create_tap_callback(time_plot)])
-            
-            # Update dilution plot panes
-            self.dilution_plot.object = dilution_plot
-            self.time_plot.object = time_plot
+            return
         
-        # OD Values plot - handle separately to allow OD plotting even if dilution data is incomplete
-        if not self.latest_od_df.empty and 'od_value' in self.latest_od_df.columns:
-            od_plots = []
-            
-            # Sort OD data by timestamp
-            if not self.target_od_df.empty and 'od_value' in self.target_od_df.columns:
+        # Sort by timestamp
+        self.dosing_events_df = self.dosing_events_df.sort_values('timestamp')
+        
+        # Filter out rows with missing volume
+        self.dosing_events_df = self.dosing_events_df[pd.notna(self.dosing_events_df['volume'])]
+        
+        if len(self.dosing_events_df) <= 1:
+            self.dilution_plot.object = hv.Text(0, 0, 'Insufficient dilution events to calculate rates').opts(width=800, height=300)
+            self.time_plot.object = hv.Text(0, 0, 'Insufficient dilution events to calculate rates').opts(width=800, height=250)
+            return
+        
+        # Calculate time between doses
+        self.dosing_events_df['next_timestamp'] = self.dosing_events_df['timestamp'].shift(-1)
+        self.dosing_events_df['time_diff_hours'] = (self.dosing_events_df['next_timestamp'] - 
+                                                  self.dosing_events_df['timestamp']).dt.total_seconds() / 3600
+        
+        # Calculate instant dilution rate (with safety check for division by zero)
+        self.dosing_events_df['instant_dilution_rate'] = np.where(
+            self.dosing_events_df['time_diff_hours'] > 0,
+            self.dosing_events_df['volume'] / self.reactor_volume / self.dosing_events_df['time_diff_hours'],
+            np.nan
+        )
+        
+        # Drop NaN and infinite values for better plotting
+        self.dosing_events_df = self.dosing_events_df.replace([np.inf, -np.inf], np.nan).dropna(subset=['instant_dilution_rate'])
+        
+        # Calculate moving average of dilution rate
+        self.dosing_events_df['moving_avg_dilution_rate'] = (
+            self.dosing_events_df['instant_dilution_rate']
+            .rolling(window=self.moving_avg_window, min_periods=1)
+            .mean()
+        )
+        
+        # HoloViews plots with tooltips
+        dilution_scatter = hv.Scatter(
+            self.dosing_events_df, 
+            'timestamp', 
+            'instant_dilution_rate',
+            label='Instant Dilution Rate'
+        ).opts(
+            color='blue',
+            size=5,
+            tools=['hover'],
+            width=800,
+            height=300,
+            title='Dilution Rate'
+        )
+        
+        dilution_line = hv.Curve(
+            self.dosing_events_df, 
+            'timestamp', 
+            'moving_avg_dilution_rate',
+            label=f'Moving Avg ({self.moving_avg_window} events)'
+        ).opts(
+            color='red',
+            line_width=2,
+            width=800,
+            height=300
+        )
+        
+        # Calculate outlier threshold for time differences
+        self.dosing_events_df['capped_time_diff'] = np.minimum(self.dosing_events_df['time_diff_hours'] * 60, 60)
+        self.dosing_events_df['is_outlier'] = self.dosing_events_df['time_diff_hours'] * 60 > 60
+        
+        # Create a dataframe for normal points and outliers
+        normal_df = self.dosing_events_df[~self.dosing_events_df['is_outlier']]
+        outlier_df = self.dosing_events_df[self.dosing_events_df['is_outlier']]
+        
+        # Time between doses plot
+        time_line = hv.Curve(
+            self.dosing_events_df,
+            'timestamp',
+            'capped_time_diff',
+            label='Minutes Between Doses'
+        ).opts(
+            color='blue',
+            line_width=1,
+            width=800,
+            height=250,
+            title='Inter-Dosing Period',
+            ylabel='Minutes Between Doses (capped at 60)',
+            tools=['hover']
+        )
+        
+        normal_scatter = hv.Scatter(
+            normal_df,
+            'timestamp',
+            'capped_time_diff'
+        ).opts(
+            color='blue',
+            size=6,
+            tools=['hover'],
+            width=800,
+            height=250
+        )
+        
+        outlier_scatter = hv.Scatter(
+            outlier_df,
+            'timestamp',
+            'capped_time_diff'
+        ).opts(
+            color='red',
+            marker='circle',
+            size=8,
+            tools=['hover'],
+            width=800,
+            height=250
+        )
+        
+        # Combine plots
+        dilution_plot = (dilution_scatter * dilution_line).opts(
+            legend_position='top_right',
+            xlabel='Time',
+            ylabel='Dilution Rate (h⁻¹)'
+        )
+        
+        time_plot = (time_line * normal_scatter * outlier_scatter).opts(
+            legend_position='top_right',
+            xlabel='Time',
+            ylabel='Minutes Between Doses',
+            ylim=(0, 65)
+        )
+        
+        # Add tap callbacks for interactions
+        dilution_plot = dilution_plot.opts(tools=['tap'])
+        dilution_plot.opts(hooks=[self._create_tap_callback(dilution_plot)])
+        
+        time_plot = time_plot.opts(tools=['tap'])
+        time_plot.opts(hooks=[self._create_tap_callback(time_plot)])
+        
+        # Update dilution plot panes
+        self.dilution_plot.object = dilution_plot
+        self.time_plot.object = time_plot
+    
+    def _update_od_plots(self):
+        """Update OD plots with both target and latest OD values"""
+        od_plots = []
+        
+        # Check if we have data for either target or latest OD
+        has_target_od = not self.target_od_df.empty and 'od_value' in self.target_od_df.columns
+        has_latest_od = not self.latest_od_df.empty and 'od_value' in self.latest_od_df.columns
+        
+        # Debug info
+        debug_info = f"OD Plotting:\n"
+        debug_info += f"Target OD data available: {has_target_od}\n"
+        debug_info += f"Latest OD data available: {has_latest_od}\n"
+        
+        if has_target_od or has_latest_od:
+            # Process target OD data
+            if has_target_od:
+                # Sort and clean target OD data
                 self.target_od_df = self.target_od_df.sort_values('timestamp')
-                
-                # Clean OD data - remove NaN, negative, and outlier values
                 self.target_od_df = self.target_od_df[
                     pd.notna(self.target_od_df['od_value']) & 
                     (self.target_od_df['od_value'] >= 0) &
                     (self.target_od_df['od_value'] < 10)  # Assuming OD > 10 is an error
                 ]
                 
+                debug_info += f"Target OD rows after cleaning: {len(self.target_od_df)}\n"
                 if not self.target_od_df.empty:
+                    debug_info += f"Target OD range: {self.target_od_df['od_value'].min():.3f} - {self.target_od_df['od_value'].max():.3f}\n"
+                
+                # Create target OD plot
+                if not self.target_od_df.empty:
+                    debug_info += f"Creating target OD plot with {len(self.target_od_df)} points\n"
                     target_od = hv.Curve(
                         self.target_od_df,
                         'timestamp',
@@ -749,31 +731,42 @@ class PioreactorAnalysis(param.Parameterized):
                         height=250
                     )
                     od_plots.append(target_od)
+                    debug_info += "Target OD plot added successfully\n"
             
-            self.latest_od_df = self.latest_od_df.sort_values('timestamp')
+            # Process latest OD data
+            if has_latest_od:
+                # Sort and clean latest OD data
+                self.latest_od_df = self.latest_od_df.sort_values('timestamp')
+                self.latest_od_df = self.latest_od_df[
+                    pd.notna(self.latest_od_df['od_value']) & 
+                    (self.latest_od_df['od_value'] >= 0) &
+                    (self.latest_od_df['od_value'] < 10)  # Assuming OD > 10 is an error
+                ]
+                
+                debug_info += f"Latest OD rows after cleaning: {len(self.latest_od_df)}\n"
+                if not self.latest_od_df.empty:
+                    debug_info += f"Latest OD range: {self.latest_od_df['od_value'].min():.3f} - {self.latest_od_df['od_value'].max():.3f}\n"
+                
+                # Create latest OD plot
+                if not self.latest_od_df.empty:
+                    debug_info += f"Creating latest OD plot with {len(self.latest_od_df)} points\n"
+                    latest_od = hv.Curve(
+                        self.latest_od_df,
+                        'timestamp',
+                        'od_value',
+                        label='Latest OD'
+                    ).opts(
+                        color='blue',
+                        line_width=2,
+                        width=800,
+                        height=250
+                    )
+                    od_plots.append(latest_od)
+                    debug_info += "Latest OD plot added successfully\n"
             
-            # Clean OD data - remove NaN, negative, and outlier values
-            self.latest_od_df = self.latest_od_df[
-                pd.notna(self.latest_od_df['od_value']) & 
-                (self.latest_od_df['od_value'] >= 0) &
-                (self.latest_od_df['od_value'] < 10)  # Assuming OD > 10 is an error
-            ]
-            
-            if not self.latest_od_df.empty:
-                latest_od = hv.Curve(
-                    self.latest_od_df,
-                    'timestamp',
-                    'od_value',
-                    label='Latest OD'
-                ).opts(
-                    color='blue',
-                    line_width=2,
-                    width=800,
-                    height=250
-                )
-                od_plots.append(latest_od)
-            
+            # Create combined OD plot
             if od_plots:
+                debug_info += f"Creating combined OD plot with {len(od_plots)} curves\n"
                 od_plot = hv.Overlay(od_plots).opts(
                     legend_position='top_right',
                     xlabel='Time',
@@ -786,25 +779,16 @@ class PioreactorAnalysis(param.Parameterized):
                 od_plot.opts(hooks=[self._create_tap_callback(od_plot)])
                 
                 self.od_plot.object = od_plot
+                debug_info += "Combined OD plot created successfully\n"
             else:
                 self.od_plot.object = hv.Text(0, 0, 'No valid OD data available').opts(width=800, height=250)
+                debug_info += "No valid OD data available for plotting\n"
         else:
             self.od_plot.object = hv.Text(0, 0, 'No OD data available').opts(width=800, height=250)
+            debug_info += "No OD data available for plotting\n"
         
-        # Try to link plots using a version-compatible approach
-        try:
-            # Method 1: Try using hvplot's linking
-            plots = [self.dilution_plot.object, self.od_plot.object, self.time_plot.object]
-            hvplots = [p for p in plots if not isinstance(p, hv.element.Text)]
-            
-            if len(hvplots) > 1:
-                self.show_success("Plots synchronized")
-        except Exception as e:
-            self.show_warning(f"Plot synchronization could not be enabled: {str(e)}")
-        
-        # Calculate statistics
-        stats_html = self._calculate_stats()
-        self.stats_output.object = stats_html
+        # Update debug info
+        self.show_debug(debug_info)
     
     def _calculate_stats(self):
         """
@@ -818,7 +802,8 @@ class PioreactorAnalysis(param.Parameterized):
             HTML-formatted statistics table
         """
         if (self.target_od_df.empty or self.latest_od_df.empty or 
-            'od_value' not in self.latest_od_df.columns):
+            'od_value' not in self.latest_od_df.columns or
+            'od_value' not in self.target_od_df.columns):
             return "<p>No OD data available for statistics.</p>"
         
         # Identify regions with constant target_od
