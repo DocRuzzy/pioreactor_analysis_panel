@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  sync-to-hub:
     runs-on: ubuntu-latest
     steps:
       - name: Sync with Hugging Face
@@ -15,5 +15,5 @@ jobs:
           github_repo_id: DocRuzzy/pioreactor_analysis_panel
           huggingface_repo_id: DocRuzzy/pioreactor_analysis_panel
           repo_type: space
-          space_sdk: streamlit
+          space_sdk: gradio
           hf_token: ${{ secrets.HF_TOKEN }}
