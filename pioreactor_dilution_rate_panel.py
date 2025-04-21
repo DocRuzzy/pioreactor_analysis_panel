@@ -612,36 +612,7 @@ class PioreactorAnalysis(param.Parameterized):
                 self.show_success(f"Bookmark added at x={plot_id.x}, y={plot_id.y}")
         
         return tap_callback
-    
-    def _update_plots(self):
-        """
-        Update all plots with current data and parameters.
         
-        Generates dilution rate plots, OD value plots, and time between doses plots.
-        Also calculates statistics and links the plots for synchronized interactions.
-        """
-        # Check if we have data
-        if self.dosing_events_df.empty or not all(col in self.dosing_events_df.columns for col in ['timestamp', 'volume']):
-            # Display empty placeholders
-            self.dilution_plot.object = hv.Text(0, 0, 'No valid dosing data found').opts(width=800, height=300)
-            self.od_plot.object = hv.Text(0, 0, 'No valid OD data found').opts(width=800, height=250)
-            self.time_plot.object = hv.Text(0, 0, 'No valid time data found').opts(width=800, height=250)
-            self.stats_output.object = "<p>No data available for plotting or statistics.</p>"
-            return
-        
-        # Update plots individually 
-        dilution_plot = self._update_dilution_plots()
-        od_plot = self._update_od_plots()
-        time_plot = self._update_time_plots()  # Our new method with volume markers
-        
-        # Link plots for synchronized zooming/panning (if needed)
-        # This part depends on how your current linking code works
-        
-        # Update statistics
-        stats_html = self._calculate_stats()
-        self.stats_output.object = stats_html
-
-    
     def _format_time_ticks(self, reference_time=None):
         # reference_time: a pd.Timestamp
         if reference_time is None:
@@ -679,6 +650,53 @@ class PioreactorAnalysis(param.Parameterized):
         formatter = CustomJSTickFormatter(code=code, args={'source': source})
         return formatter
 
+    def _update_plots(self):
+        """
+        Update all plots with current data and parameters.
+        
+        Generates dilution rate plots, OD value plots, and time between doses plots.
+        Also calculates statistics and links the plots for synchronized interactions.
+        """
+        # Check if we have data
+        if self.dosing_events_df.empty or not all(col in self.dosing_events_df.columns for col in ['timestamp', 'volume']):
+            # Display empty placeholders
+            self.dilution_plot.object = hv.Text(0, 0, 'No valid dosing data found').opts(width=800, height=300)
+            self.od_plot.object = hv.Text(0, 0, 'No valid OD data found').opts(width=800, height=250)
+            self.time_plot.object = hv.Text(0, 0, 'No valid time data found').opts(width=800, height=250)
+            self.stats_output.object = "<p>No data available for plotting or statistics.</p>"
+            return
+        
+        # Update plots individually 
+        dilution_plot = self._update_dilution_plots()
+        od_plot = self._update_od_plots()
+        time_plot = self._update_time_plots()  # Our new method with volume markers
+        
+        # Link plots for synchronized zooming/panning
+        if isinstance(dilution_plot, hv.core.overlay.Overlay) and isinstance(od_plot, hv.core.overlay.Overlay) and isinstance(time_plot, hv.core.overlay.Overlay):
+            try:
+                # Create a linked layout with the correct variable names
+                linked_plots = hv.Layout([dilution_plot, od_plot, time_plot]).cols(1)
+                linked_plots = linked_plots.opts(shared_axes=True, merge_tools=False)
+                
+                # Update the plot panes with linked versions
+                self.dilution_plot.object = dilution_plot
+                self.od_plot.object = od_plot
+                self.time_plot.object = time_plot
+            except Exception as e:
+                self.show_debug(f"Error linking plots: {str(e)}")
+                # Fall back to setting plots directly
+                self.dilution_plot.object = dilution_plot
+                self.od_plot.object = od_plot
+                self.time_plot.object = time_plot
+        else:
+            # If plots aren't overlays, set them directly
+            self.dilution_plot.object = dilution_plot
+            self.od_plot.object = od_plot
+            self.time_plot.object = time_plot
+        
+        # Update statistics
+        stats_html = self._calculate_stats()
+        self.stats_output.object = stats_html
 
     def _update_dilution_plots(self):
         """Update dilution rate and timing plots"""
@@ -855,7 +873,7 @@ class PioreactorAnalysis(param.Parameterized):
         
         # Update plot panes
         self.dilution_plot.object = dilution_plot
-        self.time_plot.object = time_plot
+        return dilution_plot
     
     
     def _update_od_plots(self):
@@ -987,6 +1005,7 @@ class PioreactorAnalysis(param.Parameterized):
                 
                 # Update plot pane
                 self.od_plot.object = od_plot
+                return od_plot
             else:
                 self.od_plot.object = hv.Text(0, 0, 'No OD data available').opts(width=800, height=250)
         else:
