@@ -23,7 +23,7 @@ import hvplot.pandas
 import holoviews as hv
 import panel as pn
 import param
-from bokeh.models import CustomJSTickFormatter, ColumnDataSource, HoverTool
+from bokeh.models import CustomJSTickFormatter, ColumnDataSource, Range1d, HoverTool
 import json
 from scipy.stats import variation
 import uuid
@@ -652,10 +652,7 @@ class PioreactorAnalysis(param.Parameterized):
 
     def _update_plots(self):
         """
-        Update all plots with current data and parameters.
-        
-        Generates dilution rate plots, OD value plots, and time between doses plots.
-        Also calculates statistics and links the plots for synchronized interactions.
+        Update all plots with current data and parameters using a direct Bokeh range sharing approach.
         """
         # Check if we have data
         if self.dosing_events_df.empty or not all(col in self.dosing_events_df.columns for col in ['timestamp', 'volume']):
@@ -666,32 +663,48 @@ class PioreactorAnalysis(param.Parameterized):
             self.stats_output.object = "<p>No data available for plotting or statistics.</p>"
             return
         
-        # Update plots individually 
-        dilution_plot = self._update_dilution_plots()
-        od_plot = self._update_od_plots()
-        time_plot = self._update_time_plots()  # Our new method with volume markers
+        # Create a shared x-axis range using Bokeh Range1d
+        shared_x_range = Range1d()
         
-        # Link plots for synchronized zooming/panning
-        if isinstance(dilution_plot, hv.core.overlay.Overlay) and isinstance(od_plot, hv.core.overlay.Overlay) and isinstance(time_plot, hv.core.overlay.Overlay):
-            try:
-                # Create a linked layout with the correct variable names
-                linked_plots = hv.Layout([dilution_plot, od_plot, time_plot]).cols(1)
-                linked_plots = linked_plots.opts(shared_axes=True, merge_tools=False)
-                
-                # Update the plot panes with linked versions
-                self.dilution_plot.object = dilution_plot
-                self.od_plot.object = od_plot
-                self.time_plot.object = time_plot
-            except Exception as e:
-                self.show_debug(f"Error linking plots: {str(e)}")
-                # Fall back to setting plots directly
-                self.dilution_plot.object = dilution_plot
-                self.od_plot.object = od_plot
-                self.time_plot.object = time_plot
+        # Get a consistent reference time for time formatting
+        if 'timestamp_localtime' in self.dosing_events_df.columns:
+            start_time = self.dosing_events_df['timestamp_localtime'].min()
         else:
-            # If plots aren't overlays, set them directly
+            start_time = self.dosing_events_df['timestamp'].min()
+            
+        # Create time formatter with consistent reference time
+        time_formatter = self._format_time_ticks(reference_time=start_time)
+        
+        # Helper function to apply time formatter to plots
+        def apply_time_formatter(plot, element):
+            if 'xaxis' in plot.handles:
+                plot.handles['xaxis'].formatter = time_formatter
+        
+        # Generate individual plots
+        dilution_plot = self._update_dilution_plots()
+        od_plot = self._update_od_plots() 
+        time_plot = self._update_time_plots()
+        
+        # Apply shared x-range and formatter to each plot if they exist
+        if dilution_plot is not None:
+            dilution_plot = dilution_plot.opts(
+                hooks=[apply_time_formatter],
+                backend_opts={'x_range': shared_x_range}
+            )
             self.dilution_plot.object = dilution_plot
+        
+        if od_plot is not None:
+            od_plot = od_plot.opts(
+                hooks=[apply_time_formatter],
+                backend_opts={'x_range': shared_x_range}
+            )
             self.od_plot.object = od_plot
+        
+        if time_plot is not None:
+            time_plot = time_plot.opts(
+                hooks=[apply_time_formatter],
+                backend_opts={'x_range': shared_x_range}
+            )
             self.time_plot.object = time_plot
         
         # Update statistics
@@ -1019,18 +1032,7 @@ class PioreactorAnalysis(param.Parameterized):
             return None
         
         # Get dataframes for normal points and outliers
-        plot_df_time = self.dosing_events_df.dropna(subset=['timestamp', 'capped_time_diff'])
-        
-        # Add volume change detection
-        if 'volume' in self.dosing_events_df.columns:
-            # Sort by timestamp to ensure correct order
-            sorted_df = self.dosing_events_df.sort_values('timestamp')
-            # Mark points where volume changes
-            sorted_df['volume_changed'] = sorted_df['volume'] != sorted_df['volume'].shift(1)
-            self.dosing_events_df = sorted_df
-        else:
-            # If no volume column, create empty flag
-            self.dosing_events_df['volume_changed'] = False
+        plot_df_time = self.dosing_events_df.dropna(subset=['elapsed_hours', 'capped_time_diff'])
         
         # Split into normal and outlier points
         if 'is_outlier' in self.dosing_events_df.columns:
@@ -1046,21 +1048,21 @@ class PioreactorAnalysis(param.Parameterized):
         # Add main time curve
         if not plot_df_time.empty:
             time_line = hv.Curve(
-                plot_df_time, 'timestamp', 'capped_time_diff', label='Minutes Between Doses'
+                plot_df_time, 'elapsed_hours', 'capped_time_diff', label='Minutes Between Doses'
             ).opts(color='blue', line_width=1, tools=['hover'])
             time_plots_overlay.append(time_line)
         
         # Add normal points
         if not normal_df.empty:
             normal_scatter = hv.Scatter(
-                normal_df, 'timestamp', 'capped_time_diff'
+                normal_df, 'elapsed_hours', 'capped_time_diff'
             ).opts(color='blue', size=6, tools=['hover'])
             time_plots_overlay.append(normal_scatter)
         
         # Add outlier points
         if not outlier_df.empty:
             outlier_scatter = hv.Scatter(
-                outlier_df, 'timestamp', 'capped_time_diff'
+                outlier_df, 'elapsed_hours', 'capped_time_diff'
             ).opts(color='red', marker='circle', size=8, tools=['hover'])
             time_plots_overlay.append(outlier_scatter)
         
@@ -1074,7 +1076,7 @@ class PioreactorAnalysis(param.Parameterized):
             # Add markers at volume change points
             volume_markers = hv.Scatter(
                 volume_change_df,
-                'timestamp',
+                'elapsed_hours',  # Changed from 'timestamp'
                 'capped_time_diff'
             ).opts(
                 color='green',
@@ -1090,8 +1092,8 @@ class PioreactorAnalysis(param.Parameterized):
             for idx, row in volume_change_df.iterrows():
                 if pd.notna(row['volume']):
                     label = hv.Text(
-                        row['timestamp'], 
-                        min(row['capped_time_diff'] + 5, 60),  # Cap at 60 to stay in view
+                        row['elapsed_hours'],  # Changed from 'timestamp'
+                        min(row['capped_time_diff'] + 5, 60),
                         f"Volume: {row['volume']} mL"
                     ).opts(text_color='green', text_font_size='10pt', text_font_style='bold')
                     time_plots_overlay.append(label)
@@ -1099,42 +1101,19 @@ class PioreactorAnalysis(param.Parameterized):
         # Combine all plot elements
         time_plot_combined = hv.Overlay(time_plots_overlay).opts(
             legend_position='top_right',
-            xlabel='Time',
+            xlabel='Time (elapsed hours)',
             ylabel='Minutes Between Doses (capped at 60)',
-            title='Inter-Dosing Period (with Volume Change Markers)',
+            title='Inter-Dosing Period',
             width=800,
             height=250,
-            ylim=(0, 65)
+            ylim=(0, 65),
+            tools=['pan', 'wheel_zoom', 'box_zoom', 'reset', 'tap']
         ) if time_plots_overlay else hv.Text(0, 0, 'No Inter-Dosing Time data').opts(width=800, height=250)
         
-        # Apply formatter safely
-        try:
-            # Try to get formatter and source, but handle different return patterns
-            format_result = self._format_time_ticks()
-            
-            # Check if result is a tuple (old style) or just a formatter (new style)
-            if isinstance(format_result, tuple) and len(format_result) == 2:
-                time_formatter, time_source = format_result
-            else:
-                # If not a tuple, assume it's just the formatter
-                time_formatter = format_result
-            
-            # Apply formatter to plot
-            def apply_time_formatter(plot, element):
-                try:
-                    plot.handles['xaxis'].formatter = time_formatter
-                except Exception as e:
-                    print(f"Error applying formatter: {e}")
-            
-            time_plot_combined = time_plot_combined.opts(
-                hooks=[apply_time_formatter],
-                tools=['pan', 'wheel_zoom', 'box_zoom', 'reset', 'tap']
-            )
-        except Exception as e:
-            print(f"Error setting time formatter: {e}")
-            # Continue without formatter if there's an error
+        # Add tap callback
+        if time_plots_overlay:
+            time_plot_combined = time_plot_combined.opts(hooks=[self._create_tap_callback(time_plot_combined)])
         
-        self.time_plot.object = time_plot_combined
         return time_plot_combined
 
     def _calculate_stats(self):
