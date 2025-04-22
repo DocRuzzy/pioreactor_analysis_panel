@@ -1,15 +1,24 @@
 # app.py - Entry point for Hugging Face Spaces
 import panel as pn
-from pioreactor_dilution_rate_panel import PioreactorAnalysis
+import os
+import sys
+from pioreactor_dilution_rate_panel import PioreactorAnalysis  # Using the correct file name
 
-# Initialize the application
-pioreactor_analysis = PioreactorAnalysis()
-
-# Set up the Panel template
+# Configure Panel for cloud environment
 pn.extension(template="fast", sizing_mode="stretch_width", notifications=True)
 
-# Make the app servable for Hugging Face Spaces
-pn.template.FastListTemplate(
+# Configure logging to help debug initialization problems
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('pioreactor-app')
+
+# Initialize the application
+logger.info("Initializing Pioreactor Analysis application")
+pioreactor_analysis = PioreactorAnalysis()
+logger.info("Analysis object created successfully")
+
+# Create the Panel template
+app = pn.template.FastListTemplate(
     site="Pioreactor Dilution Rate Analysis",
     title="Pioreactor Dilution Rate Analysis",
     sidebar=[
@@ -40,4 +49,14 @@ pn.template.FastListTemplate(
     ],
     accent_base_color="#5A7B9C",
     header_background="#393939",
-).servable()
+)
+
+# Make the template servable
+app.servable()
+
+# For Hugging Face Spaces, we need to explicitly configure the server
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 7860))  # Hugging Face expects port 7860
+    address = "0.0.0.0"  # Listen on all network interfaces
+    logger.info(f"Starting Panel server on {address}:{port}")
+    pn.serve(app, port=port, address=address, allow_websocket_origin=["*"], show=False)
