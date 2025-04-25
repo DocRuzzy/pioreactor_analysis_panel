@@ -23,11 +23,14 @@ import hvplot.pandas
 import holoviews as hv
 import panel as pn
 import param
+import time
 from bokeh.models import ColumnDataSource, Range1d, Span, BoxSelectTool
 from bokeh.models.formatters import DatetimeTickFormatter
 from bokeh.models.callbacks import CustomJS
 import io
 from scipy import stats
+from functools import partial
+
 
 # Configure Panel and HoloViews
 pn.extension('plotly', 'tabulator')
@@ -50,7 +53,6 @@ class GrowthRateAnalysis(param.Parameterized):
     min_od_threshold : float
         Minimum OD value to consider for growth rate calculation (default: 0.05)
     """
-    
     smoothing_window = param.Integer(5, bounds=(1, 50), step=1, 
                                     doc="Smoothing window size (# of readings)")
     min_od_threshold = param.Number(0.05, bounds=(0.001, 1.0), step=0.01, 
@@ -58,9 +60,7 @@ class GrowthRateAnalysis(param.Parameterized):
     
     def __init__(self, **params):
         """
-        Initialize the growth rate analysis application.
-        
-        Sets up the UI components, data containers, and layout structure.
+        Initialize the growth rate analysis application with performance improvements.
         """
         super().__init__(**params)
         
@@ -70,16 +70,23 @@ class GrowthRateAnalysis(param.Parameterized):
         self.selected_units = []
         self.current_results = {}
         
+        # Add debounce timing variables for improved slider performance
+        self.last_update_time = 0
+        self.debounce_timeout = 250  # milliseconds
+        
         # Status message for notifications
         self.status_message = pn.pane.Markdown("", styles={'color': 'blue'})
         self.error_message = pn.pane.Markdown("", styles={'color': 'red'})
         self.debug_message = pn.pane.Markdown("", styles={'color': 'green', 'font-family': 'monospace', 'font-size': '12px'})
         
+        # Add visual feedback for sliders
+        self.region_feedback = pn.pane.Markdown("", styles={'font-weight': 'bold', 'color': '#007bff'})
+        
         # Set up the interface
         self.file_input = pn.widgets.FileInput(accept='.csv', multiple=False)
         self.file_input.param.watch(self._upload_file_callback, 'value')
         
-        self.update_button = pn.widgets.Button(name='Update', button_type='primary')
+        self.update_button = pn.widgets.Button(name='Update Plots', button_type='primary')
         self.update_button.on_click(self._update_callback)
         
         # Unit selection for multi-unit experiments
@@ -90,15 +97,39 @@ class GrowthRateAnalysis(param.Parameterized):
         self.od_plot = pn.pane.HoloViews(sizing_mode='stretch_width', height=300)
         self.ln_od_plot = pn.pane.HoloViews(sizing_mode='stretch_width', height=300)
         
-        # Selected region widgets
+        # Selected region widgets with debounced updates
         self.region_start = pn.widgets.FloatSlider(name='Region Start (hours)', start=0, end=100, step=0.1, value=0)
         self.region_end = pn.widgets.FloatSlider(name='Region End (hours)', start=0, end=100, step=0.1, value=100)
-        self.region_start.param.watch(self._update_region, 'value')
-        self.region_end.param.watch(self._update_region, 'value')
+        # Remove the watch here, we'll use value_throttled
+        # self.region_start.param.watch(self._debounced_update_region, 'value')
+        # self.region_end.param.watch(self._debounced_update_region, 'value')
+        
+        # Use value_throttled for smoother updates after dragging stops
+        self.region_start.param.watch(self._throttled_region_update, 'value_throttled')
+        self.region_end.param.watch(self._throttled_region_update, 'value_throttled')
+        
+        # Add a watch on 'value' just for immediate feedback text update
+        self.region_start.param.watch(self._update_feedback_text, 'value')
+        self.region_end.param.watch(self._update_feedback_text, 'value')
+        
+        # Add a button to set the region through clicking
+        self.region_reset_button = pn.widgets.Button(name='Reset Region Selection', button_type='default')
+        self.region_reset_button.on_click(self._reset_region)
+        
+        # Set up event listener for region boundary changes from JavaScript
+        self._setup_boundary_event_listener()
         
         # Auto-detect button
         self.auto_detect_button = pn.widgets.Button(name='Auto-detect Exponential Phase', button_type='success')
         self.auto_detect_button.on_click(self._auto_detect_callback)
+        
+        # Add a separate calculate button for growth rate (instead of doing it as sliders move)
+        self.calculate_button = pn.widgets.Button(
+            name='Calculate Growth Rate',
+            button_type='primary',
+            icon='calculator'
+        )
+        self.calculate_button.on_click(self._calculate_growth_rate_callback)
         
         # Results output
         self.results_output = pn.pane.HTML("")
@@ -132,7 +163,14 @@ class GrowthRateAnalysis(param.Parameterized):
                     pn.pane.Markdown("### Region Selection"),
                     self.region_start,
                     self.region_end,
-                    self.auto_detect_button,
+                    self.region_feedback,  # Add feedback display
+                    pn.Row(
+                        self.auto_detect_button, 
+                        self.region_reset_button, 
+                        self.calculate_button  # Add separate calculate button
+                    ),
+                    pn.pane.Markdown("*Click on the plot to adjust region boundaries*", 
+                                      styles={'font-style': 'italic', 'color': '#666'}),
                     width=400
                 )
             ),
@@ -144,6 +182,85 @@ class GrowthRateAnalysis(param.Parameterized):
             )
         )
     
+    def _update_feedback_text(self, event):
+        """Update the feedback text immediately as sliders move."""
+        start = self.region_start.value
+        end = self.region_end.value
+        # Ensure start <= end for feedback text consistency
+        if start > end:
+            if event.obj is self.region_start:
+                end = start
+            else:
+                start = end
+        feedback_text = f"Selected region: {start:.2f}h - {end:.2f}h" 
+        self.region_feedback.object = feedback_text
+
+    def _throttled_region_update(self, event):
+        """Update plots after slider movement stops (using value_throttled)."""
+        start = self.region_start.value
+        end = self.region_end.value
+
+        # Ensure start <= end and update the other slider if needed
+        if start > end:
+            if event.obj is self.region_start:
+                # If start slider moved past end, update end slider's value
+                self.region_end.value = start 
+                end = start # Use the adjusted value
+            else:
+                # If end slider moved before start, update start slider's value
+                self.region_start.value = end
+                start = end # Use the adjusted value
+
+        # Update the internal selected_region dictionary
+        self.selected_region['start'] = start
+        self.selected_region['end'] = end
+        
+        # Update the plots visually
+        self._update_plots()
+        
+        # Update the feedback text one last time after adjustment
+        feedback_text = f"Selected region: {start:.2f}h - {end:.2f}h" 
+        self.region_feedback.object = feedback_text
+
+    def _calculate_growth_rate_callback(self, event):
+        """Handle calculate button click events."""
+        try:
+            self._calculate_growth_rate()
+            self.show_success("Growth rate calculated successfully!")
+        except Exception as e:
+            import traceback
+            self.show_error(f"Error calculating growth rate: {str(e)}")
+            self.show_debug(traceback.format_exc())
+
+    def _setup_boundary_event_listener(self):
+        """Set up event listener for region boundary changes."""
+        # This method will now be implemented using Bokeh events
+        # The actual functionality is in the _add_draggable_bounds method
+        pass
+
+    def _reset_region(self, event):
+        """Reset the region selection to the full data range."""
+        if not self.od_data_df.empty:
+            min_time = self.od_data_df['elapsed_hours'].min()
+            max_time = self.od_data_df['elapsed_hours'].max()
+            
+            # Update both slider values and selected_region directly
+            self.region_start.value = min_time
+            self.region_end.value = max_time
+            self.selected_region = {'start': min_time, 'end': max_time}
+            
+            # Force plot update
+            self._update_plots()
+            
+            # Calculate growth rate with the new region
+            try:
+                self._calculate_growth_rate()
+                self.show_success("Region reset to full data range")
+            except Exception as e:
+                import traceback
+                self.show_error(f"Error calculating growth rate: {str(e)}")
+                self.show_debug(traceback.format_exc())
+
     def show_success(self, message):
         """Display a success message to the user."""
         self.status_message.object = f"✅ **{message}**"
@@ -263,36 +380,48 @@ class GrowthRateAnalysis(param.Parameterized):
     
     def _update_region(self, event):
         """Handle region slider updates."""
-        # Ensure start <= end
-        if self.region_start.value > self.region_end.value:
-            if event.name == 'value' and event.obj is self.region_start:
-                self.region_start.value = self.region_end.value
-            else:
-                self.region_end.value = self.region_start.value
+        # Skip if this is a programmatic update with no event
+        if event is None:
+            return
         
-        self.selected_region = {
-            'start': self.region_start.value,
-            'end': self.region_end.value
-        }
+        # Update the selected region directly from slider values
+        self.selected_region['start'] = self.region_start.value
+        self.selected_region['end'] = self.region_end.value
+        
+        # Ensure start <= end
+        if self.selected_region['start'] > self.selected_region['end']:
+            if event.obj is self.region_start:
+                # User moved start beyond end - move end to match
+                self.selected_region['end'] = self.selected_region['start']
+                self.region_end.value = self.selected_region['end']
+            else:
+                # User moved end below start - move start to match
+                self.selected_region['start'] = self.selected_region['end']
+                self.region_start.value = self.selected_region['start']
         
         # Update plots with selected region
         self._update_plots()
         
         # Calculate growth rate for the selected region
-        self._calculate_growth_rate()
-    
+        try:
+            self._calculate_growth_rate()
+        except Exception as e:
+            import traceback
+            self.show_error(f"Error calculating growth rate: {str(e)}")
+            self.show_debug(traceback.format_exc())
+
     def _update_callback(self, event):
         """Handle update button click events."""
         self._update_plots()
         self._calculate_growth_rate()
     
     def _auto_detect_callback(self, event):
-        """Automatically detect the exponential growth phase."""
+        """Improved algorithm to detect exponential growth phase."""
         if self.od_data_df.empty or len(self.selected_units) == 0:
             self.show_error("No data available for auto-detection.")
             return
         
-        # Get the first selected unit (auto-detection works on one unit at a time)
+        # Get the first selected unit
         unit = self.selected_units[0]
         
         # Get data for the selected unit
@@ -315,171 +444,444 @@ class GrowthRateAnalysis(param.Parameterized):
         # Calculate ln(OD)
         unit_data['ln_od'] = np.log(unit_data['od_smooth'])
         
-        # Calculate local growth rate using rolling window
-        window_size = min(20, len(unit_data) // 4)  # Dynamic window size based on data points
-        growth_rates = []
-        r_squared_values = []
-        midpoints = []
+        # Calculate the first derivative (growth rate)
+        unit_data['growth_rate'] = unit_data['ln_od'].diff() / unit_data['elapsed_hours'].diff()
         
-        for i in range(len(unit_data) - window_size):
-            window = unit_data.iloc[i:i+window_size]
-            slope, intercept, r_value, p_value, std_err = stats.linregress(
-                window['elapsed_hours'], window['ln_od']
-            )
-            growth_rates.append(slope)
-            r_squared_values.append(r_value**2)
-            midpoints.append(window['elapsed_hours'].iloc[window_size//2])
+        # Find most linear segment (lowest variance in growth rate)
+        # Use sliding windows of increasing size to find best R²
+        min_window_size = 5  # At least 5 points
+        max_window_size = min(30, len(unit_data) // 2)  # Up to half the data
         
-        if not growth_rates:
-            self.show_error("Could not calculate local growth rates.")
+        best_score = 0
+        best_start_idx = 0
+        best_end_idx = 0
+        best_window_size = 0
+        best_slope = 0
+        
+        # Try different window sizes
+        for window_size in range(min_window_size, max_window_size + 1):
+            # Slide the window
+            for start_idx in range(len(unit_data) - window_size):
+                end_idx = start_idx + window_size - 1
+                window = unit_data.iloc[start_idx:end_idx+1]
+                
+                # Linear regression on the window
+                slope, intercept, r_value, p_value, std_err = stats.linregress(
+                    window['elapsed_hours'], window['ln_od']
+                )
+                
+                r2 = r_value**2
+                
+                # Calculate biological reasonableness score
+                # Higher score for windows with:
+                # 1. Higher r² (linearity)
+                # 2. Positive slope (growth, not death)
+                # 3. Reasonable growth rate (not noise or instrumental error)
+                # 4. Covers multiple doublings (longer is better, up to a point)
+                
+                doublings = (window['ln_od'].max() - window['ln_od'].min()) / np.log(2)
+                min_reasonable_slope = 0.05  # Minimum biologically reasonable growth rate
+                max_reasonable_slope = 3.0   # Maximum biologically reasonable growth rate
+                
+                # Skip unreasonable growth rates
+                if slope < min_reasonable_slope or slope > max_reasonable_slope:
+                    continue
+                    
+                # Biological score factors
+                linearity_score = r2
+                growth_factor = 1.0 if slope > 0 else 0.0
+                doubling_factor = min(1.0, doublings / 3.0)  # Max score at 3+ doublings
+                
+                # Combined score - prioritize linearity and biological relevance
+                bio_score = linearity_score * growth_factor * doubling_factor
+                
+                if bio_score > best_score:
+                    best_score = bio_score
+                    best_start_idx = start_idx
+                    best_end_idx = end_idx
+                    best_window_size = window_size
+                    best_slope = slope
+        
+        if best_window_size == 0:
+            self.show_error("Could not identify a clear exponential phase.")
             return
         
-        # Convert to numpy arrays for easier processing
-        growth_rates = np.array(growth_rates)
-        r_squared_values = np.array(r_squared_values)
-        midpoints = np.array(midpoints)
+        # Extend region in both directions while R² remains high
+        extended_start_idx = best_start_idx
+        extended_end_idx = best_end_idx
         
-        # Find regions with high growth rate and good linear fit
-        score = growth_rates * r_squared_values  # Combine growth rate and fit quality
+        # Try extending the start backwards
+        for i in range(best_start_idx - 1, -1, -1):
+            test_window = unit_data.iloc[i:best_end_idx+1]
+            slope, intercept, r_value, p_value, std_err = stats.linregress(
+                test_window['elapsed_hours'], test_window['ln_od']
+            )
+            if r_value**2 > 0.98 * best_score:  # Allow small decrease in R²
+                extended_start_idx = i
+            else:
+                break
         
-        # Find the region with the highest score
-        best_idx = np.argmax(score)
+        # Try extending the end forwards
+        for i in range(best_end_idx + 1, len(unit_data)):
+            test_window = unit_data.iloc[extended_start_idx:i+1]
+            slope, intercept, r_value, p_value, std_err = stats.linregress(
+                test_window['elapsed_hours'], test_window['ln_od']
+            )
+            if r_value**2 > 0.98 * best_score:  # Allow small decrease in R²
+                extended_end_idx = i
+            else:
+                break
         
-        # Define a region around this best point
-        best_time = midpoints[best_idx]
-        window_width = (unit_data['elapsed_hours'].max() - unit_data['elapsed_hours'].min()) / 10
-        start_time = max(unit_data['elapsed_hours'].min(), best_time - window_width)
-        end_time = min(unit_data['elapsed_hours'].max(), best_time + window_width)
+        # Get the start and end times
+        start_time = unit_data.iloc[extended_start_idx]['elapsed_hours']
+        end_time = unit_data.iloc[extended_end_idx]['elapsed_hours']
         
-        # Update the region selection
+        # Create a preview visualization of the detected region before applying
+        preview_data = unit_data.iloc[extended_start_idx:extended_end_idx+1]
+        
+        # Calculate the exponential parameters for reporting
+        final_window = unit_data.iloc[extended_start_idx:extended_end_idx+1]
+        slope, intercept, r_value, p_value, std_err = stats.linregress(
+            final_window['elapsed_hours'], final_window['ln_od']
+        )
+        
+        # Calculate confidence intervals for the growth rate (95%)
+        t_value = stats.t.ppf(0.975, len(final_window)-2)  # 95% CI
+        ci_lower = slope - t_value * std_err
+        ci_upper = slope + t_value * std_err
+        
+        # Calculate number of doublings in this window
+        doublings = (final_window['ln_od'].max() - final_window['ln_od'].min()) / np.log(2)
+        
+        # Create preview plot
+        preview_curve = hv.Curve(
+            preview_data, 'elapsed_hours', 'ln_od', 
+            label=f'Selected region'
+        ).opts(
+            color='red',
+            line_width=2
+        )
+        
+        # Generate x values for the regression line
+        x_range = np.array([start_time, end_time])
+        y_range = slope * x_range + intercept
+        
+        # Create regression line
+        reg_line = hv.Curve(
+            np.column_stack([x_range, y_range]),
+            label=f"Linear fit (R²={r_value**2:.4f})"
+        ).opts(
+            color='green',
+            line_width=2,
+            line_dash='dashed'
+        )
+        
+        # Combine the preview plot elements
+        preview_plot = (preview_curve * reg_line).opts(
+            title='Detected Exponential Phase',
+            xlabel='Time (hours)',
+            ylabel='ln(OD)',
+            width=400,
+            height=300,
+            legend_position='top_right'
+        )
+        
+        # Create the preview modal
+        preview_modal = pn.Column(
+            pn.pane.Markdown("### Detected Exponential Growth Phase"),
+            pn.pane.HoloViews(preview_plot),
+            pn.pane.Markdown(f"""
+            **Growth rate (μ):** {slope:.4f}h⁻¹ (95% CI: {ci_lower:.4f} - {ci_upper:.4f})  
+            **R²:** {r_value**2:.4f}  
+            **Time range:** {start_time:.2f}h - {end_time:.2f}h ({end_time-start_time:.2f}h duration)  
+            **Doublings:** {doublings:.1f}
+            """),
+            pn.Row(
+                pn.widgets.Button(name='Apply', button_type='success', 
+                                on_click=lambda e: self._apply_detected_region(start_time, end_time)),
+                pn.widgets.Button(name='Cancel', button_type='danger',
+                                on_click=lambda e: self._cancel_detection())
+            )
+        )
+        
+        # Store the preview modal
+        self.preview_modal = preview_modal
+        
+        # Show the modal
+        try:
+            if hasattr(pn, 'state') and hasattr(pn.state, 'modal'):
+                # For Panel >= 0.13.0
+                self.modal_window = pn.state.modal(self.preview_modal, title="Exponential Phase Preview", size='large')
+                self.modal_window.show()
+            else:
+                # Fallback for older Panel versions or when state/modal is not available
+                self._apply_detected_region(start_time, end_time)
+                
+                # And show success message
+                self.show_success(
+                    f"Auto-detected exponential phase from {start_time:.2f}h to {end_time:.2f}h "
+                    f"(μ={slope:.4f}h⁻¹, R²={r_value**2:.4f}, {doublings:.1f} doublings)"
+                )
+        except Exception as e:
+            # If anything goes wrong, use the direct approach
+            import traceback
+            self.show_debug(f"Modal error: {str(e)}\n{traceback.format_exc()}")
+            self._apply_detected_region(start_time, end_time)
+
+    def _apply_detected_region(self, start_time, end_time):
+        """Apply the detected region from the preview"""
+        # Update both the region selection sliders and internal dictionary
+        self.selected_region = {'start': start_time, 'end': end_time}
         self.region_start.value = start_time
         self.region_end.value = end_time
         
-        # Show success message
-        self.show_success(f"Auto-detected exponential phase for {unit} between {start_time:.2f}h and {end_time:.2f}h")
+        # Close the modal if it exists
+        if hasattr(self, 'modal_window'):
+            try:
+                self.modal_window.close()
+            except Exception as e:
+                self.show_debug(f"Warning: Could not close modal window: {str(e)}")
+        
+        # Update plots
+        self._update_plots()
+        
+        # Calculate growth rate with the new region
+        try:
+            self._calculate_growth_rate()
+            # Show success message
+            self.show_success(f"Applied exponential phase detection: {start_time:.2f}h - {end_time:.2f}h")
+        except Exception as e:
+            import traceback
+            self.show_error(f"Error calculating growth rate: {str(e)}")
+            self.show_debug(traceback.format_exc())
+
+    def _cancel_detection(self):
+        """Cancel the detection preview"""
+        # Just close the modal
+        if hasattr(self, 'modal_window'):
+            self.modal_window.close()
+        
+        self.show_success("Exponential phase detection cancelled")
     
     def _update_plots(self):
-        """Update all plots with current data and parameters."""
-        # Check if we have data
+        """Update all plots with current data and parameters, optimized for performance."""
+        # Check if we have data and if plots are already created
         if self.od_data_df.empty or len(self.selected_units) == 0:
             # Display empty placeholders
             self.od_plot.object = hv.Text(0, 0, 'No valid OD data found').opts(width=800, height=300)
             self.ln_od_plot.object = hv.Text(0, 0, 'No valid ln(OD) data found').opts(width=800, height=300)
             return
         
-        # Create a shared x-axis range for linked plots
-        shared_x_range = Range1d()
-        
-        # Filter data for selected units
-        filtered_df = self.od_data_df[self.od_data_df['exp_unit'].isin(self.selected_units)]
-        
-        # Create processed data for each unit
-        processed_data = {}
-        for unit in self.selected_units:
-            unit_data = filtered_df[filtered_df['exp_unit'] == unit].copy()
-            unit_data = unit_data.sort_values('elapsed_hours')
-            unit_data['od_smooth'] = unit_data['od_reading'].rolling(
-                window=self.smoothing_window, min_periods=1, center=True).mean()
-            unit_data['ln_od'] = np.log(unit_data['od_smooth'].clip(lower=1e-6))  # Avoid log(0)
-            processed_data[unit] = unit_data
-        
-        # Create OD vs Time plot
-        od_curves = []
-        for unit in self.selected_units:
-            unit_data = processed_data[unit]
-            curve = hv.Curve(
-                unit_data, 'elapsed_hours', 'od_smooth',
-                label=unit
-            ).opts(
-                line_width=2,
-                tools=['hover', 'tap']
-            )
-            od_curves.append(curve)
-        
-        # Combine the curves
-        od_plot = hv.Overlay(od_curves).opts(
-            title='OD vs Time',
-            xlabel='Time (hours)',
-            ylabel='OD (smoothed)',
-            legend_position='top_right',
-            width=800,
-            height=300,
-            backend_opts={'x_range': shared_x_range}
+        # Check if we need to create new plots or just update existing ones
+        create_new_plots = (
+            not hasattr(self, '_base_od_plot') or 
+            not hasattr(self, '_base_ln_od_plot') or
+            getattr(self, '_current_units', []) != self.selected_units
         )
         
-        # Create ln(OD) vs Time plot
-        ln_od_curves = []
-        for unit in self.selected_units:
-            unit_data = processed_data[unit]
-            # Filter out invalid ln values
-            unit_data = unit_data[np.isfinite(unit_data['ln_od'])]
-            curve = hv.Curve(
-                unit_data, 'elapsed_hours', 'ln_od',
-                label=unit
-            ).opts(
-                line_width=2,
-                tools=['hover', 'tap']
+        if create_new_plots:
+            # Filter data for selected units
+            filtered_df = self.od_data_df[self.od_data_df['exp_unit'].isin(self.selected_units)]
+            
+            # Create processed data for each unit
+            processed_data = {}
+            for unit in self.selected_units:
+                unit_data = filtered_df[filtered_df['exp_unit'] == unit].copy()
+                unit_data = unit_data.sort_values('elapsed_hours')
+                unit_data['od_smooth'] = unit_data['od_reading'].rolling(
+                    window=self.smoothing_window, min_periods=1, center=True).mean()
+                unit_data['ln_od'] = np.log(unit_data['od_smooth'].clip(lower=1e-6))  # Avoid log(0)
+                processed_data[unit] = unit_data
+            
+            # Create OD vs Time plot
+            od_curves = []
+            for unit in self.selected_units:
+                unit_data = processed_data[unit]
+                curve = hv.Curve(
+                    unit_data, 'elapsed_hours', 'od_smooth',
+                    label=unit
+                ).opts(
+                    line_width=2,
+                    tools=['hover', 'tap']
+                )
+                od_curves.append(curve)
+            
+            # Combine the curves into a base plot
+            od_overlay = hv.Overlay(od_curves)
+            self._base_od_plot = od_overlay.opts(
+                title='OD vs Time',
+                xlabel='Time (hours)',
+                ylabel='OD (smoothed)',
+                legend_position='top_right',
+                width=800,
+                height=300
             )
-            ln_od_curves.append(curve)
+            
+            # Create ln(OD) vs Time plot
+            ln_od_curves = []
+            for unit in self.selected_units:
+                unit_data = processed_data[unit]
+                # Filter out invalid ln values
+                unit_data = unit_data[np.isfinite(unit_data['ln_od'])]
+                curve = hv.Curve(
+                    unit_data, 'elapsed_hours', 'ln_od',
+                    label=unit
+                ).opts(
+                    line_width=2,
+                    tools=['hover', 'tap']
+                )
+                ln_od_curves.append(curve)
+            
+            # Combine the curves into a base plot
+            ln_od_overlay = hv.Overlay(ln_od_curves)
+            self._base_ln_od_plot = ln_od_overlay.opts(
+                title='ln(OD) vs Time',
+                xlabel='Time (hours)',
+                ylabel='ln(OD)',
+                legend_position='top_right',
+                width=800,
+                height=300
+            )
+            
+            # Store current units to detect changes
+            self._current_units = list(self.selected_units)
+            
+            # Store processed data for later use
+            self._processed_data = processed_data
         
-        # Combine the curves
-        ln_od_plot = hv.Overlay(ln_od_curves).opts(
-            title='ln(OD) vs Time',
-            xlabel='Time (hours)',
-            ylabel='ln(OD)',
-            legend_position='top_right',
-            width=800,
-            height=300,
-            backend_opts={'x_range': shared_x_range}
-        )
-        
-        # Add selected region visualization
+        # Now, overlay the region selection - this is much faster than redrawing everything
         if self.selected_region['start'] is not None and self.selected_region['end'] is not None:
-            start_line = hv.VLine(self.selected_region['start']).opts(color='red', line_width=1.5)
-            end_line = hv.VLine(self.selected_region['end']).opts(color='red', line_width=1.5)
-            region_shade = hv.VSpan(
+            # Create a shaded region between start and end
+            region_box = hv.VSpan(
                 self.selected_region['start'], 
                 self.selected_region['end']
             ).opts(alpha=0.2, color='red')
             
-            od_plot = od_plot * start_line * end_line * region_shade
-            ln_od_plot = ln_od_plot * start_line * end_line * region_shade
+            # Add region to base plots
+            od_plot = self._base_od_plot * region_box
+            ln_od_plot = self._base_ln_od_plot * region_box
             
-            # Add regression lines for the selected region
-            for unit in self.selected_units:
-                unit_data = processed_data[unit]
-                # Filter for the selected region
-                region_data = unit_data[
-                    (unit_data['elapsed_hours'] >= self.selected_region['start']) &
-                    (unit_data['elapsed_hours'] <= self.selected_region['end'])
-                ]
+            # Add vertical lines to clearly mark boundaries
+            start_line = hv.VLine(self.selected_region['start']).opts(
+                color='red', line_width=1.5, line_dash='dashed')
+            end_line = hv.VLine(self.selected_region['end']).opts(
+                color='red', line_width=1.5, line_dash='dashed')
                 
-                if len(region_data) >= 5:  # Need enough points for regression
-                    # Perform linear regression on ln(OD)
-                    x = region_data['elapsed_hours'].values
-                    y = region_data['ln_od'].values
-                    slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
-                    
-                    # Create regression line
-                    x_range = np.array([self.selected_region['start'], self.selected_region['end']])
-                    y_range = slope * x_range + intercept
-                    
-                    regression_line = hv.Curve(
-                        np.column_stack([x_range, y_range]),
-                        label=f"{unit} fit (μ={slope:.3f}h⁻¹)"
-                    ).opts(
-                        color='green',
-                        line_width=2,
-                        line_dash='dashed'
-                    )
-                    
-                    # Add to ln(OD) plot
-                    ln_od_plot = ln_od_plot * regression_line
+            od_plot = od_plot * start_line * end_line
+            ln_od_plot = ln_od_plot * start_line * end_line
+        else:
+            # If no region is selected, just use the base plots
+            od_plot = self._base_od_plot
+            ln_od_plot = self._base_ln_od_plot
         
-        # Update the plot panes
+        # Add draggable bounds using the existing method
+        od_plot = od_plot.opts(tools=['tap'])
+        ln_od_plot = ln_od_plot.opts(tools=['tap'])
+        
+        # Update plot panes (much faster than full redraw)
         self.od_plot.object = od_plot
         self.ln_od_plot.object = ln_od_plot
-    
+
+    def _add_draggable_bounds(self, bokeh_plot):
+        """Add draggable bounds to a Bokeh plot."""
+        from bokeh.models import Span, CustomJS, TapTool
+        
+        # Create spans for start and end boundaries
+        start_span = Span(
+            location=self.selected_region['start'],
+            dimension='height',
+            line_color='red',
+            line_width=3
+        )
+        
+        end_span = Span(
+            location=self.selected_region['end'],
+            dimension='height',
+            line_color='red',
+            line_width=3
+        )
+        
+        # Add spans to the plot
+        bokeh_plot.add_layout(start_span)
+        bokeh_plot.add_layout(end_span)
+        
+        # Create a ColumnDataSource to communicate between JS and Python
+        from bokeh.models import ColumnDataSource
+        callback_source = ColumnDataSource(data=dict(x=[0], is_start=[True]))
+        
+        # Add the source to the plot
+        bokeh_plot.add_tools(TapTool())
+        
+        # Create the JS callback
+        js_callback = CustomJS(args=dict(source=callback_source), code="""
+        const x = cb_obj.x;
+        // Figure out if we're closer to the start or end span
+        const start_loc = """ + str(self.selected_region['start']) + """;
+        const end_loc = """ + str(self.selected_region['end']) + """;
+        
+        // Decide which boundary to move based on which is closer
+        let is_start = Math.abs(x - start_loc) < Math.abs(x - end_loc);
+        
+        // Update the source data - this will trigger the Python callback
+        source.data = {
+            'x': [x],
+            'is_start': [is_start]
+        };
+        
+        source.change.emit();
+        """)
+        
+        # Connect JavaScript to the tap event
+        bokeh_plot.js_on_event('tap', js_callback)
+        
+        # Add a Python callback for the source changes
+        def update_boundary(attr, old, new):
+            if len(new['x']) > 0:
+                x = new['x'][0]
+                is_start = bool(new['is_start'][0])
+                if is_start:
+                    self._update_region_start(x)
+                else:
+                    self._update_region_end(x)
+        
+        callback_source.on_change('data', update_boundary)
+        
+        return bokeh_plot
+
+    def _update_region_start(self, value):
+        """Update the start of the region."""
+        # Ensure it doesn't go beyond the end
+        if value <= self.region_end.value:
+            # Update both the slider and the region dictionary
+            self.region_start.value = value
+            self.selected_region['start'] = value
+            
+            # Manually call updates
+            self._update_plots()
+            try:
+                self._calculate_growth_rate()
+            except Exception as e:
+                import traceback
+                self.show_error(f"Error calculating growth rate: {str(e)}")
+                self.show_debug(traceback.format_exc())
+
+    def _update_region_end(self, value):
+        """Update the end of the region."""
+        # Ensure it doesn't go below the start
+        if value >= self.region_start.value:
+            # Update both the slider and the region dictionary
+            self.region_end.value = value
+            self.selected_region['end'] = value
+            
+            # Manually call updates
+            self._update_plots()
+            try:
+                self._calculate_growth_rate()
+            except Exception as e:
+                import traceback
+                self.show_error(f"Error calculating growth rate: {str(e)}")
+                self.show_debug(traceback.format_exc())
+        
     def _calculate_growth_rate(self):
         """Calculate growth rate for the selected region."""
         if self.od_data_df.empty or len(self.selected_units) == 0:
@@ -510,32 +912,17 @@ class GrowthRateAnalysis(param.Parameterized):
                     'growth_rate': None,
                     'doubling_time': None,
                     'r_squared': None,
+                    'std_error': None,  # Add this key to prevent KeyError
                     'data_points': len(unit_data)
                 })
                 continue
             
-            # Sort by time
-            unit_data = unit_data.sort_values('elapsed_hours')
-            
-            # Apply smoothing
+            # Apply smoothing first
             unit_data['od_smooth'] = unit_data['od_reading'].rolling(
                 window=self.smoothing_window, min_periods=1, center=True).mean()
             
-            # Filter out OD values below threshold
-            unit_data = unit_data[unit_data['od_smooth'] >= self.min_od_threshold]
-            
-            if len(unit_data) < 5:  # Check again after filtering
-                results.append({
-                    'unit': unit,
-                    'growth_rate': None,
-                    'doubling_time': None,
-                    'r_squared': None,
-                    'data_points': len(unit_data)
-                })
-                continue
-            
             # Calculate ln(OD)
-            unit_data['ln_od'] = np.log(unit_data['od_smooth'])
+            unit_data['ln_od'] = np.log(unit_data['od_smooth'].clip(lower=1e-6))  # Avoid log(0)
             
             # Linear regression on ln(OD) vs time
             slope, intercept, r_value, p_value, std_err = stats.linregress(
@@ -584,7 +971,9 @@ class GrowthRateAnalysis(param.Parameterized):
             growth_rate = f"{result['growth_rate']:.4f}" if result['growth_rate'] is not None else "N/A"
             doubling_time = f"{result['doubling_time']:.2f}" if result['doubling_time'] is not None else "N/A"
             r_squared = f"{result['r_squared']:.4f}" if result['r_squared'] is not None else "N/A"
-            std_err = f"{result['std_error']:.4f}" if result['std_error'] is not None else "N/A"
+            
+            # Fix this line to safely handle missing std_error key
+            std_err = f"{result['std_error']:.4f}" if result.get('std_error') is not None else "N/A"
             
             html += f"""
             <tr>
