@@ -13,7 +13,7 @@ Features:
 - User bookmarking system for points of interest
 - Customizable parameters (reactor volume, moving average window)
 
-Author: Russell Kirk Pirlo Improved by Claude
+Author: Russell Kirk Pirlo wiht aid from Claude
 Date: April 21, 2025
 """
 

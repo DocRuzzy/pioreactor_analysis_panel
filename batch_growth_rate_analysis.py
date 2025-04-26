@@ -50,12 +50,15 @@ class GrowthRateAnalysis(param.Parameterized):
         Number of readings to include in moving average calculations (default: 5)
     min_od_threshold : float
         Minimum OD value to consider for growth rate calculation (default: 0.05)
+    semi_log_plot : boolean
+        Use semi-logarithmic scale for OD plot (default: True)
     """
     
     smoothing_window = param.Integer(5, bounds=(1, 50), step=1, 
                                     doc="Smoothing window size (# of readings)")
     min_od_threshold = param.Number(0.05, bounds=(0.001, 1.0), step=0.01, 
                                    doc="Minimum OD threshold for analysis")
+    semi_log_plot = param.Boolean(True, doc="Use semi-logarithmic scale for OD plot")
     
     def __init__(self, **params):
         """
@@ -88,7 +91,7 @@ class GrowthRateAnalysis(param.Parameterized):
         self.file_input.param.watch(self._upload_file_callback, 'value')
         
         self.update_button = pn.widgets.Button(name='Update Plots', button_type='primary')
-        self.update_button.on_click(self._update_plots_callback) # Changed callback
+        self.update_button.on_click(self._update_plots_callback)
         
         # Unit selection for multi-unit experiments
         self.unit_selector = pn.widgets.MultiSelect(name='Select Units', options=[])
@@ -98,11 +101,19 @@ class GrowthRateAnalysis(param.Parameterized):
         self.od_plot = pn.pane.HoloViews(sizing_mode='stretch_width', height=300)
         self.ln_od_plot = pn.pane.HoloViews(sizing_mode='stretch_width', height=300)
         
-        # Selected region widgets
+        # Selected region widgets - sliders
         self.region_start = pn.widgets.FloatSlider(name='Region Start (hours)', start=0, end=100, step=0.1, value=0)
         self.region_end = pn.widgets.FloatSlider(name='Region End (hours)', start=0, end=100, step=0.1, value=100)
-        self.region_start.param.watch(self._update_region, 'value')
-        self.region_end.param.watch(self._update_region, 'value')
+        
+        # Add manual input text fields for precise control
+        self.region_start_input = pn.widgets.FloatInput(name='Start Value', width=100)
+        self.region_end_input = pn.widgets.FloatInput(name='End Value', width=100)
+        
+        # Set up callbacks for all region control widgets
+        self.region_start.param.watch(self._update_region_from_slider, 'value')
+        self.region_end.param.watch(self._update_region_from_slider, 'value')
+        self.region_start_input.param.watch(self._update_region_from_input, 'value')
+        self.region_end_input.param.watch(self._update_region_from_input, 'value')
         
         # Auto-detect button
         self.auto_detect_button = pn.widgets.Button(name='Auto-detect Exponential Phase', button_type='success')
@@ -123,7 +134,8 @@ class GrowthRateAnalysis(param.Parameterized):
                     pn.pane.Markdown("### Settings"),
                     self.param.smoothing_window,
                     self.param.min_od_threshold,
-                    self.update_button, # Renamed from 'Update' to 'Update Plots'
+                    self.param.semi_log_plot,
+                    self.update_button,
                     width=400
                 ),
                 pn.Column(
@@ -142,17 +154,23 @@ class GrowthRateAnalysis(param.Parameterized):
                 ),
                 pn.Column(
                     pn.pane.Markdown("### Region Selection"),
-                    self.region_start,
-                    self.region_end,
+                    pn.Row(
+                        pn.Column(self.region_start, width=300),
+                        pn.Column(self.region_start_input, width=100)
+                    ),
+                    pn.Row(
+                        pn.Column(self.region_end, width=300),
+                        pn.Column(self.region_end_input, width=100)
+                    ),
                     self.auto_detect_button,
-                    width=400
+                    width=450
                 )
             ),
             pn.Tabs(
                 ('OD vs Time', pn.Column(self.od_plot)),
                 ('ln(OD) vs Time', pn.Column(self.ln_od_plot)),
                 ('Results', pn.Column(
-                    self.add_analysis_button, # Add button here
+                    self.add_analysis_button,
                     self.results_output
                 )),
                 ('Debug', self.debug_message)
@@ -160,6 +178,7 @@ class GrowthRateAnalysis(param.Parameterized):
         )
         # Initial update of the (empty) results display
         self._update_results_display()
+        self.param.watch(self._update_plots_callback, 'semi_log_plot')
 
     def show_success(self, message):
         """Display a success message to the user."""
@@ -269,6 +288,7 @@ class GrowthRateAnalysis(param.Parameterized):
             min_time = self.od_data_df['elapsed_hours'].min()
             max_time = self.od_data_df['elapsed_hours'].max()
             
+            # Update slider ranges and values
             self.region_start.start = min_time
             self.region_start.end = max_time
             self.region_start.value = min_time
@@ -276,6 +296,10 @@ class GrowthRateAnalysis(param.Parameterized):
             self.region_end.start = min_time
             self.region_end.end = max_time
             self.region_end.value = max_time
+            
+            # Update the text input values to match sliders
+            self.region_start_input.value = min_time
+            self.region_end_input.value = max_time
             
             self.selected_region = {'start': min_time, 'end': max_time}
         else:
@@ -287,14 +311,43 @@ class GrowthRateAnalysis(param.Parameterized):
         self.selected_units = self.unit_selector.value
         self._update_plots() # Only update plots, calculation is separate
 
-    def _update_region(self, event):
-        """Handle region slider updates."""
+    def _update_region_from_slider(self, event):
+        """Handle region slider updates and synchronize with text inputs."""
+        # Update the corresponding text input
+        if event.obj is self.region_start:
+            self.region_start_input.value = event.new
+        elif event.obj is self.region_end:
+            self.region_end_input.value = event.new
+        
+        self._update_region()
+    
+    def _update_region_from_input(self, event):
+        """Handle text input updates and synchronize with sliders."""
+        # Update the corresponding slider
+        if event.obj is self.region_start_input:
+            # Make sure the value is within slider bounds
+            value = max(min(event.new, self.region_start.end), self.region_start.start)
+            self.region_start.value = value
+            # Ensure the input shows the constrained value
+            if value != event.new:
+                self.region_start_input.value = value
+        elif event.obj is self.region_end_input:
+            # Make sure the value is within slider bounds
+            value = max(min(event.new, self.region_end.end), self.region_end.start)
+            self.region_end.value = value
+            # Ensure the input shows the constrained value
+            if value != event.new:
+                self.region_end_input.value = value
+        
+        self._update_region()
+    
+    def _update_region(self):
+        """Update the selected region values and validate them."""
         # Ensure start <= end
         if self.region_start.value > self.region_end.value:
-            if event.name == 'value' and event.obj is self.region_start:
-                self.region_start.value = self.region_end.value
-            else:
-                self.region_end.value = self.region_start.value
+            # Adjust end to match start
+            self.region_end.value = self.region_start.value
+            self.region_end_input.value = self.region_start.value
         
         self.selected_region = {
             'start': self.region_start.value,
@@ -302,12 +355,14 @@ class GrowthRateAnalysis(param.Parameterized):
         }
         
         # Update plots with selected region
-        self._update_plots() # Only update plots, calculation is separate
+        self._update_plots()
 
     def _update_plots_callback(self, event):
-        """Handle update button click events - only updates plots."""
+        """Handle update button click events or semi_log_plot changes."""
         self._update_plots()
         self.show_success("Plots updated with current settings.")
+        # Add debug info
+        self.show_debug(f"Plot update triggered. Semi-log mode: {self.semi_log_plot}")
 
     def _auto_detect_callback(self, event):
         """Automatically detect the exponential growth phase."""
@@ -399,9 +454,11 @@ class GrowthRateAnalysis(param.Parameterized):
         start_time = max(self.region_start.start, start_time)
         end_time = min(self.region_end.end, end_time)
 
-        # Update the region selection sliders (triggers _update_region -> _update_plots)
+        # Update the region selection sliders and text inputs
         self.region_start.value = start_time
+        self.region_start_input.value = start_time
         self.region_end.value = end_time
+        self.region_end_input.value = end_time
         
         # Show success message
         self.show_success(f"Auto-detected exponential phase for {unit} between {start_time:.2f}h and {end_time:.2f}h. Plots updated.")
@@ -444,16 +501,24 @@ class GrowthRateAnalysis(param.Parameterized):
             )
             od_curves.append(curve)
         
-        # Combine the curves
-        od_plot = hv.Overlay(od_curves).opts(
-            title='OD vs Time',
-            xlabel='Time (hours)',
-            ylabel='OD (smoothed)',
-            legend_position='top_right',
-            width=800,
-            height=300,
-            backend_opts={'x_range': shared_x_range}
-        )
+        # Set up plot options - ALWAYS SEMI-LOG
+        plot_opts = {
+            'title': 'OD vs Time (Semi-log)',
+            'xlabel': 'Time (hours)',
+            'ylabel': 'OD (smoothed, log scale)',
+            'legend_position': 'top_right',
+            'width': 800,
+            'height': 300,
+        }
+        
+        # Always use log scale in backend options
+        backend_opts = {
+            'x_range': shared_x_range,
+            'y_axis_type': 'log'  # Always use log scale
+        }
+        
+        # Apply all options
+        od_plot = hv.Overlay(od_curves).opts(**plot_opts, backend_opts=backend_opts)
         
         # Create ln(OD) vs Time plot
         ln_od_curves = []
@@ -532,8 +597,10 @@ class GrowthRateAnalysis(param.Parameterized):
                         # Add to ln(OD) plot
                         ln_od_plot = ln_od_plot * regression_line
                     except ValueError as ve:
-                         self.show_debug(f"Skipping regression line for {unit}: Linregress error - {ve}")
-
+                        self.show_debug(f"Skipping regression line for {unit}: Linregress error - {ve}")
+        
+        # Add debug info 
+        self.show_debug(f"Plot update complete. Semi-log mode: {self.semi_log_plot}, backend_opts: {backend_opts}")
         
         # Update the plot panes
         self.od_plot.object = od_plot
