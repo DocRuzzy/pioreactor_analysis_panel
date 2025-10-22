@@ -1,3 +1,13 @@
+---
+title: Pioreactor Analysis Panel
+emoji: 🧫
+colorFrom: blue
+colorTo: green
+sdk: docker
+pinned: false
+license: mit
+---
+
 # Pioreactor Dilution Rate Analysis Tool
 
 An interactive web application for analyzing bioreactor dilution rates from Pioreactor data. This tool is designed for academic research and can be used to analyze the performance of continuous culture bioreactors.
@@ -28,7 +38,7 @@ To run this application locally:
    ```
    python app.py
    ```
-4. Open your browser to `http://localhost:5006`
+4. Open your browser to `http://localhost:7860`
 
 ## Usage Instructions
 
@@ -43,8 +53,8 @@ To run this application locally:
 If you use this tool in your research, please cite:
 
 ```
-[Your Name]. (2025). Pioreactor Dilution Rate Analysis Tool. 
-Hugging Face Spaces. https://huggingface.co/spaces/[your-username]/[space-name]
+Russell Kirk Pirlo & Claude. (2025). Pioreactor Dilution Rate Analysis Tool. 
+Hugging Face Spaces. https://huggingface.co/spaces/DocRuzzy/pioreactor_analysis_panel
 ```
 
 ## License
