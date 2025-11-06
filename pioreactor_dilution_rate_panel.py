@@ -23,7 +23,7 @@ import hvplot.pandas
 import holoviews as hv
 import panel as pn
 import param
-from bokeh.models import CustomJSTickFormatter, ColumnDataSource, HoverTool
+from bokeh.models import CustomJSTickFormatter, ColumnDataSource, HoverTool, Range1d
 import json
 from scipy.stats import variation
 import uuid
@@ -32,6 +32,8 @@ import base64
 import re
 # Import HoloViews linking
 import holoviews.plotting.links
+# Import continuous culture growth rate calculation
+from continuous_growth_rate import calculate_growth_rate_continuous, analyze_growth_phases
 
 # Configure Panel and HoloViews
 pn.extension('plotly', 'tabulator')
@@ -100,6 +102,9 @@ class PioreactorAnalysis(param.Parameterized):
         
         # Data preview pane
         self.data_preview = pn.pane.HTML("", styles={'overflow-x': 'auto'})
+
+        # Shared x-range (time) across plots for linked zoom/pan
+        self._shared_time_xrange = None
         
         # Set up the interface
         self.file_input = pn.widgets.FileInput(accept='.csv', multiple=False)
@@ -112,6 +117,11 @@ class PioreactorAnalysis(param.Parameterized):
         self.dilution_plot = pn.pane.HoloViews(sizing_mode='stretch_width', height=300)
         self.od_plot = pn.pane.HoloViews(sizing_mode='stretch_width', height=250)
         self.time_plot = pn.pane.HoloViews(sizing_mode='stretch_width', height=250)
+        self.growth_rate_plot = pn.pane.HoloViews(sizing_mode='stretch_width', height=300)
+        
+        # Growth rate data container
+        self.growth_rate_df = pd.DataFrame()
+        self.growth_phases_df = pd.DataFrame()
         
         # Stats output
         self.stats_output = pn.pane.HTML("")
@@ -134,6 +144,17 @@ class PioreactorAnalysis(param.Parameterized):
         self.export_time_plot_button = pn.widgets.Button(name='📊 Export Time Plot', button_type='default', width=200)
         self.export_time_plot_button.on_click(self._export_time_plot_callback)
         
+        # Calculate growth rate button
+        self.calculate_growth_button = pn.widgets.Button(name='🧬 Calculate Growth Rate from OD & Dilution', button_type='success', width=300)
+        self.calculate_growth_button.on_click(self._calculate_growth_rate_callback)
+        
+        # Growth rate export button
+        self.export_growth_button = pn.widgets.Button(name='📊 Export Growth Rate Plot', button_type='default', width=200)
+        self.export_growth_button.on_click(self._export_growth_rate_callback)
+        
+        # Growth rate output
+        self.growth_rate_output = pn.pane.HTML("")
+        
         # Session save/load buttons
         self.save_session_button = pn.widgets.Button(name='💾 Save Session', button_type='primary', width=150)
         self.save_session_button.on_click(self.save_session_callback)
@@ -149,25 +170,10 @@ class PioreactorAnalysis(param.Parameterized):
             pn.pane.Markdown("No bookmarks yet. Click on points in the graph to bookmark them.")
         )
         
-        # Main layout
-        self.main_layout = pn.Column(
-            pn.pane.Markdown("# Pioreactor Dilution Rate Analysis"),
-            pn.Row(
-                pn.Column(
-                    pn.pane.Markdown("### Settings"),
-                    self.param.reactor_volume,
-                    self.param.moving_avg_window,
-                    self.param.time_axis_mode,
-                    pn.pane.Markdown("---"),
-                    pn.pane.Markdown("### Plot Appearance"),
-                    self.param.plot_width,
-                    self.param.plot_height,
-                    self.param.font_size,
-                    self.param.color_scheme,
-                    self.param.plot_dpi,
-                    self.update_button,
-                    width=400
-                ),
+        # Controls grouped in a compact Accordion inside a separate tab
+        controls_accordion = pn.Accordion(
+            (
+                "Upload & Session",
                 pn.Column(
                     pn.pane.Markdown("### Upload Data"),
                     self.file_input,
@@ -179,33 +185,82 @@ class PioreactorAnalysis(param.Parameterized):
                     pn.pane.Markdown("### Session Management"),
                     pn.Row(self.save_session_button, self.load_session_input),
                     self.session_status_text,
-                    width=400
-                )
+                ),
             ),
-            pn.Tabs(
-                ('Dilution Analysis', pn.Column(
-                    pn.Row(self.export_dilution_plot_button, align='end'),
-                    self.dilution_plot,
-                    pn.Row(self.export_od_plot_button, align='end'),
-                    self.od_plot,
-                    pn.Row(self.export_time_plot_button, align='end'),
-                    self.time_plot
-                )),
-                ('Statistics', pn.Column(
-                    pn.Row(
-                        self.export_stats_button,
-                        self.export_all_button
-                    ),
-                    self.stats_output
-                )),
-                ('Debug', self.debug_message)
-            ),
-            pn.Row(
+            (
+                "Settings",
                 pn.Column(
-                    self.bookmarks_title,
-                    self.bookmarks_container
+                    pn.Row(self.param.reactor_volume, self.param.moving_avg_window),
+                    self.param.time_axis_mode,
+                    self.update_button,
+                ),
+            ),
+            (
+                "Plot Appearance",
+                pn.Column(
+                    pn.Row(self.param.plot_width, self.param.plot_height),
+                    pn.Row(self.param.font_size, self.param.color_scheme, self.param.plot_dpi),
+                ),
+            ),
+            (
+                "Bookmarks",
+                pn.Column(self.bookmarks_container),
+            ),
+            active=[],  # start collapsed for minimal vertical space
+            sizing_mode='stretch_width'
+        )
+
+        # Main layout with plots first, controls moved to separate tab
+        self.main_layout = pn.Tabs(
+            (
+                'Dilution Analysis',
+                pn.Column(
+                    pn.pane.Markdown("# Pioreactor Dilution Rate Analysis"),
+                    pn.Row(self.export_dilution_plot_button, self.export_od_plot_button, self.export_time_plot_button, align='end'),
+                    self.dilution_plot,
+                    self.od_plot,
+                    self.time_plot,
+                    sizing_mode='stretch_width'
                 )
-            )
+            ),
+            (
+                'Growth Rate (μ)',
+                pn.Column(
+                    pn.pane.Markdown("# Continuous Culture Growth Rate"),
+                    pn.pane.Markdown("""
+                    Calculate specific growth rate (μ) from dilution rate and OD dynamics.
+                    
+                    **Theory**: μ = D + (1/X)·(dX/dt)
+                    - At steady state (OD constant): μ ≈ D
+                    - When OD changes: μ accounts for both dilution and biomass accumulation
+                    """),
+                    pn.Row(self.calculate_growth_button, align='center'),
+                    pn.Row(self.export_growth_button, align='end'),
+                    self.growth_rate_plot,
+                    self.growth_rate_output,
+                    sizing_mode='stretch_width'
+                )
+            ),
+            (
+                'Controls',
+                pn.Column(
+                    pn.pane.Markdown("# Controls"),
+                    controls_accordion,
+                    sizing_mode='stretch_width'
+                )
+            ),
+            (
+                'Statistics',
+                pn.Column(
+                    pn.Row(self.export_stats_button, self.export_all_button),
+                    self.stats_output,
+                    sizing_mode='stretch_width'
+                )
+            ),
+            (
+                'Debug',
+                self.debug_message
+            ),
         )
         
         # Add watchers for plot aesthetic parameters to auto-update
@@ -777,30 +832,38 @@ class PioreactorAnalysis(param.Parameterized):
         od_plot = self._update_od_plots() 
         time_plot = self._update_time_plots()
         
-        # Store plots for range linking
-        plots_to_link = []
+        # Hook to link x-axis (time) ranges across plots
+        def link_time_axis(plot, element):
+            try:
+                xr = plot.handles.get('x_range') or getattr(plot.state, 'x_range', None)
+                if xr is None:
+                    return
+                # Initialize shared range from the first available plot
+                if self._shared_time_xrange is None:
+                    # Create a dedicated Range1d so future plot rebuilds keep the same object
+                    start = getattr(xr, 'start', None)
+                    end = getattr(xr, 'end', None)
+                    self._shared_time_xrange = Range1d(start=start, end=end)
+                # Assign the shared range to this plot
+                if getattr(plot.state, 'x_range', None) is not self._shared_time_xrange:
+                    plot.state.x_range = self._shared_time_xrange
+                    # Also update handles for consistency
+                    plot.handles['x_range'] = self._shared_time_xrange
+            except Exception:
+                pass
         
         # Apply formatter to each plot if they exist and collect for linking
         if dilution_plot is not None:
-            dilution_plot = dilution_plot.opts(hooks=[apply_time_formatter])
-            plots_to_link.append(dilution_plot)
+            dilution_plot = dilution_plot.opts(hooks=[apply_time_formatter, link_time_axis])
             self.dilution_plot.object = dilution_plot
         
         if od_plot is not None:
-            od_plot = od_plot.opts(hooks=[apply_time_formatter])
-            plots_to_link.append(od_plot)
+            od_plot = od_plot.opts(hooks=[apply_time_formatter, link_time_axis])
             self.od_plot.object = od_plot
         
         if time_plot is not None:
-            time_plot = time_plot.opts(hooks=[apply_time_formatter])
-            plots_to_link.append(time_plot)
+            time_plot = time_plot.opts(hooks=[apply_time_formatter, link_time_axis])
             self.time_plot.object = time_plot
-        
-        # Link the x-axis ranges of all plots
-        if len(plots_to_link) >= 2:
-            # Create RangeToolLink to sync x-axis ranges
-            for i in range(len(plots_to_link) - 1):
-                hv.plotting.links.RangeToolLink(plots_to_link[i], plots_to_link[i + 1], axes=['x'])
         
         # Update statistics
         stats_html = self._calculate_stats()
@@ -1609,6 +1672,204 @@ class PioreactorAnalysis(param.Parameterized):
         except Exception as e:
             self.show_error(f"Failed to export plot: {str(e)}")
     
+    def _calculate_growth_rate_callback(self, event):
+        """Calculate growth rate from OD and dilution rate data."""
+        if self.latest_od_df.empty or self.dosing_events_df.empty:
+            self.show_error("Need both OD data and dilution events to calculate growth rate. Please upload data first.")
+            return
+        
+        try:
+            self.loading_spinner.value = True
+            
+            # Check if we have the necessary columns
+            if 'elapsed_hours' not in self.latest_od_df.columns:
+                self.show_error("Missing time data in OD measurements")
+                return
+            
+            if 'instant_dilution_rate' not in self.dosing_events_df.columns:
+                self.show_error("Dilution rate not calculated. Please ensure dosing events are processed.")
+                return
+            
+            # Calculate growth rate
+            self.growth_rate_df = calculate_growth_rate_continuous(
+                od_df=self.latest_od_df,
+                dilution_rate_df=self.dosing_events_df,
+                od_column='od_value',
+                time_column='elapsed_hours',
+                dilution_column='instant_dilution_rate',
+                smoothing_window=self.moving_avg_window,
+                min_od_threshold=0.05,
+                use_savgol=True
+            )
+            
+            # Analyze growth phases
+            self.growth_phases_df = analyze_growth_phases(self.growth_rate_df)
+            
+            # Update plot
+            self._update_growth_rate_plot()
+            
+            # Update statistics output
+            self._update_growth_rate_stats()
+            
+            self.show_success(f"Growth rate calculated successfully! Found {len(self.growth_phases_df)} growth phases.")
+            
+        except Exception as e:
+            import traceback
+            self.show_error(f"Error calculating growth rate: {str(e)}")
+            self.show_debug(f"Growth rate calculation error:\n{traceback.format_exc()}")
+        finally:
+            self.loading_spinner.value = False
+    
+    def _update_growth_rate_plot(self):
+        """Create and update the growth rate plot."""
+        if self.growth_rate_df.empty:
+            self.growth_rate_plot.object = hv.Text(0, 0, 'Click "Calculate Growth Rate" button above').opts(width=800, height=300)
+            return
+        
+        colors = self._get_color_palette()
+        plot_opts = self._get_plot_options()
+        
+        # Growth rate vs time
+        growth_curve = hv.Curve(
+            self.growth_rate_df,
+            'elapsed_hours',
+            'growth_rate',
+            label='Growth Rate (μ)'
+        ).opts(
+            color=colors[0],
+            line_width=2,
+            width=plot_opts['width'],
+            height=plot_opts['height'],
+            tools=['hover'],
+            ylabel='Growth Rate μ (h⁻¹)',
+            xlabel='Time (hours)',
+            title='Specific Growth Rate in Continuous Culture',
+            fontsize=plot_opts['fontsize']
+        )
+        
+        # Dilution rate for comparison
+        dilution_curve = hv.Curve(
+            self.growth_rate_df,
+            'elapsed_hours',
+            'dilution_rate',
+            label='Dilution Rate (D)'
+        ).opts(
+            color=colors[1],
+            line_width=2,
+            line_dash='dashed',
+            width=plot_opts['width'],
+            height=plot_opts['height'],
+            fontsize=plot_opts['fontsize']
+        )
+        
+        # Highlight steady-state regions
+        steady_state_df = self.growth_rate_df[self.growth_rate_df['steady_state'] == True]
+        if not steady_state_df.empty:
+            steady_scatter = hv.Scatter(
+                steady_state_df,
+                'elapsed_hours',
+                'growth_rate',
+                label='Steady State'
+            ).opts(
+                color=colors[2],
+                size=8,
+                marker='circle',
+                alpha=0.6,
+                width=plot_opts['width'],
+                height=plot_opts['height'],
+                fontsize=plot_opts['fontsize']
+            )
+            combined_plot = (growth_curve * dilution_curve * steady_scatter).opts(
+                legend_position='top_right'
+            )
+        else:
+            combined_plot = (growth_curve * dilution_curve).opts(
+                legend_position='top_right'
+            )
+        
+        self.growth_rate_plot.object = combined_plot
+    
+    def _update_growth_rate_stats(self):
+        """Generate HTML statistics table for growth rate analysis."""
+        if self.growth_phases_df.empty:
+            self.growth_rate_output.object = "<p>No growth phase data available.</p>"
+            return
+        
+        html = "<h3>Growth Phase Analysis</h3>"
+        html += """
+        <table style="width:100%; border-collapse:collapse; margin-top:10px;">
+          <thead>
+            <tr style="background-color:#f2f2f2;">
+              <th style="padding:8px; border:1px solid #ddd; text-align:left;">Phase</th>
+              <th style="padding:8px; border:1px solid #ddd; text-align:left;">Type</th>
+              <th style="padding:8px; border:1px solid #ddd; text-align:left;">Duration (h)</th>
+              <th style="padding:8px; border:1px solid #ddd; text-align:left;">μ (h⁻¹)</th>
+              <th style="padding:8px; border:1px solid #ddd; text-align:left;">D (h⁻¹)</th>
+              <th style="padding:8px; border:1px solid #ddd; text-align:left;">Mean OD</th>
+              <th style="padding:8px; border:1px solid #ddd; text-align:left;">ΔOD</th>
+              <th style="padding:8px; border:1px solid #ddd; text-align:left;">Points</th>
+            </tr>
+          </thead>
+          <tbody>
+        """
+        
+        for _, phase in self.growth_phases_df.iterrows():
+            phase_type = "Steady State" if phase['is_steady_state'] else "Dynamic"
+            html += f"""
+            <tr>
+              <td style="padding:8px; border:1px solid #ddd;">{int(phase['phase_id'])}</td>
+              <td style="padding:8px; border:1px solid #ddd;">{phase_type}</td>
+              <td style="padding:8px; border:1px solid #ddd;">{phase['duration']:.2f}</td>
+              <td style="padding:8px; border:1px solid #ddd;">{phase['mean_growth_rate']:.4f} ± {phase['std_growth_rate']:.4f}</td>
+              <td style="padding:8px; border:1px solid #ddd;">{phase['mean_dilution_rate']:.4f}</td>
+              <td style="padding:8px; border:1px solid #ddd;">{phase['mean_od']:.3f}</td>
+              <td style="padding:8px; border:1px solid #ddd;">{phase['od_change']:+.3f}</td>
+              <td style="padding:8px; border:1px solid #ddd;">{int(phase['n_points'])}</td>
+            </tr>
+            """
+        
+        html += """
+          </tbody>
+        </table>
+        <p style="margin-top:15px; font-size:12px; color:#666;">
+        <strong>Note:</strong> Steady state is defined as regions where |dOD/dt|/OD < 5% per hour.
+        In steady state, μ ≈ D. In dynamic regions, μ = D + (1/X)·(dX/dt).
+        </p>
+        """
+        
+        self.growth_rate_output.object = html
+    
+    def _export_growth_rate_callback(self, event):
+        """Export growth rate plot to PNG file."""
+        if self.growth_rate_plot.object is None or str(self.growth_rate_plot.object) == 'Text':
+            self.show_error("No growth rate plot to export. Please calculate growth rate first.")
+            return
+        
+        try:
+            from datetime import datetime
+            import holoviews as hv
+            
+            # Generate filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"growth_rate_plot_{timestamp}.png"
+            
+            # Save plot using HoloViews save function with DPI
+            hv.save(self.growth_rate_plot.object, filename, fmt='png', dpi=self.plot_dpi)
+            
+            # Also export growth rate data to CSV
+            if not self.growth_rate_df.empty:
+                data_filename = f"growth_rate_data_{timestamp}.csv"
+                self.growth_rate_df.to_csv(data_filename, index=False)
+                
+                phases_filename = f"growth_phases_{timestamp}.csv"
+                self.growth_phases_df.to_csv(phases_filename, index=False)
+                
+                self.show_success(f"Exported: {filename}, {data_filename}, and {phases_filename}")
+            else:
+                self.show_success(f"Growth rate plot exported to {filename}")
+        except Exception as e:
+            self.show_error(f"Failed to export growth rate: {str(e)}")
+    
     def _export_all_callback(self, event):
         """Export all plots and data to a timestamped folder."""
         import os
@@ -1747,11 +2008,29 @@ class PioreactorAnalysis(param.Parameterized):
                     return f"{x}"
 
             html = f"""
-            <div style=\"border: 1px solid #ddd; border-radius: 5px; padding: 15px; margin: 10px 0; background-color: #f9f9f9;\">
+            <style>
+              /* Compact single-line rows with ellipsis */
+              .data-preview-table table.dataframe {{
+                border-collapse: collapse;
+                font-size: 12px;
+              }}
+              .data-preview-table table.dataframe th,
+              .data-preview-table table.dataframe td {{
+                padding: 2px 6px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                max-width: 240px;
+                line-height: 1.1;
+                vertical-align: middle;
+              }}
+              .data-preview-table ul.summary-list li {{ margin: 2px 0; }}
+            </style>
+            <div class=\"data-preview-table\" style=\"border: 1px solid #ddd; border-radius: 5px; padding: 15px; margin: 10px 0; background-color: #f9f9f9;\">
                 <h3 style=\"margin-top:0; color: #333;\">📊 Data Preview</h3>
                 <div style=\"margin-bottom: 15px;\">
                     <strong>Summary:</strong>
-                    <ul style=\"margin: 5px 0;\">
+                    <ul class=\"summary-list\" style=\"margin: 5px 0;\">
                         <li>Total Rows: {total_rows}</li>
                         <li>Columns ({len(cols)}): {', '.join(cols)}</li>
                         <li>Time Range: {time_range}</li>
@@ -1759,7 +2038,7 @@ class PioreactorAnalysis(param.Parameterized):
                     </ul>
                 </div>
                 <strong>First 10 Rows:</strong>
-                <div style=\"overflow-x: auto; margin-top: 10px;\">
+                <div style=\"overflow-x: auto; margin-top: 10px; max-height: 320px; overflow-y: auto;\">
                     {preview_df.head(10).to_html(index=False, border=1, classes='dataframe',
                         float_format=_float_fmt)}
                 </div>

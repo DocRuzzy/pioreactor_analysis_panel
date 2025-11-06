@@ -180,18 +180,10 @@ class GrowthRateAnalysis(param.Parameterized):
         # Loading indicator (reuse existing spinner)
         self.loading_indicator = self.loading_spinner
         
-        # Main layout
-        self.main_layout = pn.Column(
-            pn.pane.Markdown("# Growth Rate Analysis for Batch Culture"),
-            pn.Row(
-                pn.Column(
-                    pn.pane.Markdown("### Settings"),
-                    self.param.smoothing_window,
-                    self.param.min_od_threshold,
-                    self.param.semi_log_plot,
-                    self.update_button,
-                    width=400
-                ),
+        # Controls grouped in a compact Accordion for separate Controls tab
+        controls_accordion = pn.Accordion(
+            (
+                "Upload & Session",
                 pn.Column(
                     pn.pane.Markdown("### Upload Data"),
                     self.file_input,
@@ -203,65 +195,93 @@ class GrowthRateAnalysis(param.Parameterized):
                     pn.pane.Markdown("### Session Management"),
                     pn.Row(self.save_session_button, self.load_session_input),
                     self.status_text,
-                    width=400
                 ),
+            ),
+            (
+                "Settings",
                 pn.Column(
-                    pn.pane.Markdown("### Yield Calculation"),
-                    self.param.reactor_volume,
-                    self.param.initial_substrate_conc,
+                    pn.Row(self.param.smoothing_window, self.param.min_od_threshold),
+                    self.param.semi_log_plot,
+                    self.update_button,
+                ),
+            ),
+            (
+                "Yield Calculation",
+                pn.Column(
+                    pn.Row(self.param.reactor_volume, self.param.initial_substrate_conc),
                     pn.pane.Markdown("*Required for apparent yield calculation*", 
                                    styles={'font-size': '11px', 'color': '#666'}),
-                    pn.pane.Markdown("---"),
-                    pn.pane.Markdown("### Plot Appearance"),
-                    self.param.plot_width,
-                    self.param.plot_height,
-                    self.param.font_size,
-                    self.param.color_scheme,
-                    self.param.plot_dpi,
+                ),
+            ),
+            (
+                "Plot Appearance",
+                pn.Column(
+                    pn.Row(self.param.plot_width, self.param.plot_height),
+                    pn.Row(self.param.font_size, self.param.color_scheme, self.param.plot_dpi),
                     pn.pane.Markdown("*DPI applies to exported images*", 
                                    styles={'font-size': '11px', 'color': '#666'}),
-                    width=400
-                )
-            ),
-            pn.Row(
-                pn.Column(
-                    pn.pane.Markdown("### Unit Selection"),
-                    self.unit_selector,
-                    width=300
                 ),
+            ),
+            active=[],  # start collapsed
+            sizing_mode='stretch_width'
+        )
+        
+        # Main layout with plots and analysis tools first, controls in separate tab
+        self.main_layout = pn.Tabs(
+            (
+                'Analysis',
                 pn.Column(
-                    pn.pane.Markdown("### Region Selection"),
+                    pn.pane.Markdown("# Growth Rate Analysis for Batch Culture"),
                     pn.Row(
-                        pn.Column(self.region_start, width=300),
-                        pn.Column(self.region_start_input, width=100)
+                        pn.Column(
+                            pn.pane.Markdown("### Unit Selection"),
+                            self.unit_selector,
+                            width=300
+                        ),
+                        pn.Column(
+                            pn.pane.Markdown("### Region Selection"),
+                            pn.Row(
+                                pn.Column(self.region_start, width=300),
+                                pn.Column(self.region_start_input, width=100)
+                            ),
+                            pn.Row(
+                                pn.Column(self.region_end, width=300),
+                                pn.Column(self.region_end_input, width=100)
+                            ),
+                            self.auto_detect_button,
+                            width=450
+                        )
                     ),
-                    pn.Row(
-                        pn.Column(self.region_end, width=300),
-                        pn.Column(self.region_end_input, width=100)
-                    ),
-                    self.auto_detect_button,
-                    width=450
+                    pn.Row(self.export_od_plot_button, self.export_ln_od_plot_button, align='end'),
+                    self.od_plot,
+                    self.ln_od_plot,
+                    sizing_mode='stretch_width'
                 )
             ),
-            pn.Tabs(
-                ('OD vs Time', pn.Column(
-                    pn.Row(self.export_od_plot_button, align='end'),
-                    self.od_plot
-                )),
-                ('ln(OD) vs Time', pn.Column(
-                    pn.Row(self.export_ln_od_plot_button, align='end'),
-                    self.ln_od_plot
-                )),
-                ('Results', pn.Column(
+            (
+                'Controls',
+                pn.Column(
+                    pn.pane.Markdown("# Controls"),
+                    controls_accordion,
+                    sizing_mode='stretch_width'
+                )
+            ),
+            (
+                'Results',
+                pn.Column(
                     pn.Row(
                         self.add_analysis_button,
                         self.export_csv_button,
                         self.clear_results_button,
                         self.export_all_button
                     ),
-                    self.results_output
-                )),
-                ('Debug', self.debug_message)
+                    self.results_output,
+                    sizing_mode='stretch_width'
+                )
+            ),
+            (
+                'Debug',
+                self.debug_message
             )
         )
         # Initial update of the (empty) results display

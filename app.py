@@ -14,55 +14,75 @@ pn.extension(template="fast", sizing_mode="stretch_width", notifications=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('pioreactor-app')
 
-# Create an app selector with lazy loading
-class AppSelector(param.Parameterized):
-    current_app = param.Selector(default="Batch Growth Rate", 
-                               objects=["Batch Growth Rate", "Dilution Rate"])
-    
-    def __init__(self, **params):
-        super().__init__(**params)
-        # Create app instance cache but don't initialize anything yet
-        self._app_instances = {}
-        
-    def _get_app_instance(self, app_name):
-        """Lazy initializer for applications"""
-        if app_name not in self._app_instances:
-            logger.info(f"Initializing application: {app_name}")
-            
-            if app_name == "Batch Growth Rate":
-                self._app_instances[app_name] = GrowthRateAnalysis().view()
-            elif app_name == "Dilution Rate":
-                self._app_instances[app_name] = PioreactorAnalysis().view()
-            
-            logger.info(f"{app_name} application initialized successfully")
-        
-        return self._app_instances[app_name]
-    
-    @param.depends('current_app')
-    def view(self):
-        return self._get_app_instance(self.current_app)
+"""Restructured with collapsible left sidebar and analysis type selector."""
 
-app_selector = AppSelector()
+# Initialize both analysis instances
+batch_analysis = GrowthRateAnalysis()
+dilution_analysis = PioreactorAnalysis()
 
-# Create the Panel template
+# Analysis selector widget
+analysis_selector = pn.widgets.RadioButtonGroup(
+    name='Analysis Type',
+    options=['Batch Growth Rate', 'Dilution Rate'],
+    value='Batch Growth Rate',
+    button_type='primary'
+)
+
+# Dynamic content based on selector
+@pn.depends(analysis_selector.param.value)
+def get_analysis_panel(analysis_type):
+    if analysis_type == 'Batch Growth Rate':
+        return batch_analysis.view()
+    else:
+        return dilution_analysis.view()
+
+# Build collapsible sidebar with general info and instructions
+sidebar_controls = [
+    pn.pane.Markdown("## Pioreactor Analysis"),
+    pn.pane.Markdown("---"),
+    pn.pane.Markdown("### Select Analysis Type"),
+    analysis_selector,
+    pn.pane.Markdown("---"),
+    pn.pane.Markdown("""
+    ### Quick Start
+    
+    1. **Select Analysis Type** using the buttons above
+    
+    2. **Upload Data** in the Controls tab
+       
+       **Batch Growth Rate Requirements:**
+       - CSV export with **absolute OD** (not normalized)
+       - Timestamp and OD reading columns
+       
+       **Dilution Rate Requirements:**
+       - CSV export with **automation dilution events**
+       - Must include OD readings for growth rate calculation
+       - Dilution event data (volume, timestamp)
+    
+    3. **View Plots** at the top of the analysis panel
+    
+    4. **Adjust Settings** in the Controls tab
+    """),
+    pn.pane.Markdown("---"),
+    pn.pane.Markdown("""
+    ### About
+    
+    - **Batch Growth Rate**: Calculate growth rates, doubling times, and yields from OD measurements in batch culture
+    
+    - **Dilution Rate**: Analyze dilution rates, OD tracking, dosing intervals, and **calculate growth rates** in continuous culture
+      - *Growth rate calculation*: When OD is steady, μ ≈ D (dilution rate). When OD changes, μ is calculated from both dilution and OD dynamics.
+    """),
+]
+
+# Create the Panel template with a collapsible sidebar
 app = pn.template.FastListTemplate(
     site="Pioreactor Analysis Tools",
     title="Pioreactor Analysis Tools",
-    sidebar=[
-        pn.pane.Markdown("## Navigation"),
-        app_selector.param.current_app,
-        pn.pane.Markdown("### About"),
-        pn.pane.Markdown("""
-        This application provides analysis tools for Pioreactor data:
-        - Batch Growth Rate Analysis: Analyze growth rates from batch culture experiments
-        - Dilution Rate Analysis: Analyze dilution rates in continuous culture
-        """)
-    ],
-    main=[
-        app_selector.view
-    ],
+    sidebar=sidebar_controls,
+    main=[get_analysis_panel],
     accent_base_color="#5A7B9C",
     header_background="#393939",
+    sidebar_width=280,
 )
 
 # Make the template servable
