@@ -23,7 +23,7 @@ import hvplot.pandas
 import holoviews as hv
 import panel as pn
 import param
-from bokeh.models import CustomJSTickFormatter, ColumnDataSource, Range1d, HoverTool
+from bokeh.models import CustomJSTickFormatter, ColumnDataSource, HoverTool
 import json
 from scipy.stats import variation
 import uuid
@@ -56,9 +56,25 @@ class PioreactorAnalysis(param.Parameterized):
     """
     
     reactor_volume = param.Number(14.0, bounds=(1, 100), step=0.1, 
-                                  doc="Reactor volume in mL")
+                                  doc="Reactor volume in mL. This is used to calculate dilution rates from media volumes. Typical Pioreactor volume is 14 mL.")
     moving_avg_window = param.Integer(30, bounds=(1, 50), step=1, 
-                                      doc="Moving average window (# of events)")
+                                      doc="Moving average window (# of events). Larger windows provide smoother curves but may obscure rapid changes. Start with 20-30 for typical experiments.")
+    time_axis_mode = param.Selector(default="Elapsed Time (hours)", 
+                                    objects=["Elapsed Time (hours)", "Actual Time (datetime)", "Both (dual axis)"],
+                                    doc="Time axis display mode. 'Elapsed Time' shows hours from experiment start. 'Actual Time' shows real timestamps. 'Both' displays elapsed time with actual time on top axis.")
+    
+    # Plot aesthetic parameters
+    plot_width = param.Integer(1200, bounds=(400, 3000), step=50, 
+                              doc="Width of plots in pixels. Larger widths show more detail but require more screen space.")
+    plot_height = param.Integer(400, bounds=(200, 1000), step=50, 
+                               doc="Height of plots in pixels. Taller plots provide better vertical resolution.")
+    font_size = param.Integer(12, bounds=(8, 24), step=1, 
+                             doc="Base font size for plot labels and titles in points.")
+    color_scheme = param.Selector(default='default', 
+                                 objects=['default', 'wong', 'grayscale'],
+                                 doc="Color scheme for plots. 'wong' is colorblind-friendly, 'grayscale' for printing.")
+    plot_dpi = param.Integer(150, bounds=(50, 600), step=50, 
+                            doc="Resolution (DPI) for exported plot images. Higher values produce sharper images but larger files.")
     
     def __init__(self, **params):
         """
@@ -79,6 +95,12 @@ class PioreactorAnalysis(param.Parameterized):
         self.error_message = pn.pane.Markdown("", styles={'color': 'red'})
         self.debug_message = pn.pane.Markdown("", styles={'color': 'green', 'font-family': 'monospace', 'font-size': '12px'})
         
+        # Loading spinner (inactive by default)
+        self.loading_spinner = pn.indicators.LoadingSpinner(value=False, width=24, height=24)
+        
+        # Data preview pane
+        self.data_preview = pn.pane.HTML("", styles={'overflow-x': 'auto'})
+        
         # Set up the interface
         self.file_input = pn.widgets.FileInput(accept='.csv', multiple=False)
         self.file_input.param.watch(self._upload_file_callback, 'value')
@@ -94,6 +116,33 @@ class PioreactorAnalysis(param.Parameterized):
         # Stats output
         self.stats_output = pn.pane.HTML("")
         
+        # Export statistics button
+        self.export_stats_button = pn.widgets.Button(name='📥 Export Statistics to CSV', button_type='success')
+        self.export_stats_button.on_click(self._export_statistics_callback)
+        
+        # Batch export all button
+        self.export_all_button = pn.widgets.Button(name='📦 Export All (Plots + Data)', button_type='success', width=250)
+        self.export_all_button.on_click(self._export_all_callback)
+        
+        # Export plot buttons
+        self.export_dilution_plot_button = pn.widgets.Button(name='📊 Export Dilution Rate Plot', button_type='default', width=200)
+        self.export_dilution_plot_button.on_click(self._export_dilution_plot_callback)
+        
+        self.export_od_plot_button = pn.widgets.Button(name='📊 Export OD Plot', button_type='default', width=200)
+        self.export_od_plot_button.on_click(self._export_od_plot_callback)
+        
+        self.export_time_plot_button = pn.widgets.Button(name='📊 Export Time Plot', button_type='default', width=200)
+        self.export_time_plot_button.on_click(self._export_time_plot_callback)
+        
+        # Session save/load buttons
+        self.save_session_button = pn.widgets.Button(name='💾 Save Session', button_type='primary', width=150)
+        self.save_session_button.on_click(self.save_session_callback)
+        
+        self.load_session_input = pn.widgets.FileInput(accept='.json', multiple=False, name='📂 Load Session')
+        self.load_session_input.param.watch(self.load_session_callback, 'value')
+        
+        self.session_status_text = pn.pane.Markdown("", styles={'font-size': '12px', 'margin-top': '10px'})
+        
         # Bookmarks section
         self.bookmarks_title = pn.pane.Markdown("### Bookmarks")
         self.bookmarks_container = pn.Column(
@@ -108,24 +157,47 @@ class PioreactorAnalysis(param.Parameterized):
                     pn.pane.Markdown("### Settings"),
                     self.param.reactor_volume,
                     self.param.moving_avg_window,
+                    self.param.time_axis_mode,
+                    pn.pane.Markdown("---"),
+                    pn.pane.Markdown("### Plot Appearance"),
+                    self.param.plot_width,
+                    self.param.plot_height,
+                    self.param.font_size,
+                    self.param.color_scheme,
+                    self.param.plot_dpi,
                     self.update_button,
                     width=400
                 ),
                 pn.Column(
                     pn.pane.Markdown("### Upload Data"),
                     self.file_input,
+                    pn.Row(self.loading_spinner),
                     self.status_message,
                     self.error_message,
+                    self.data_preview,
+                    pn.pane.Markdown("---"),
+                    pn.pane.Markdown("### Session Management"),
+                    pn.Row(self.save_session_button, self.load_session_input),
+                    self.session_status_text,
                     width=400
                 )
             ),
             pn.Tabs(
                 ('Dilution Analysis', pn.Column(
+                    pn.Row(self.export_dilution_plot_button, align='end'),
                     self.dilution_plot,
+                    pn.Row(self.export_od_plot_button, align='end'),
                     self.od_plot,
+                    pn.Row(self.export_time_plot_button, align='end'),
                     self.time_plot
                 )),
-                ('Statistics', self.stats_output),
+                ('Statistics', pn.Column(
+                    pn.Row(
+                        self.export_stats_button,
+                        self.export_all_button
+                    ),
+                    self.stats_output
+                )),
                 ('Debug', self.debug_message)
             ),
             pn.Row(
@@ -135,6 +207,15 @@ class PioreactorAnalysis(param.Parameterized):
                 )
             )
         )
+        
+        # Add watchers for plot aesthetic parameters to auto-update
+        self.param.watch(self._on_aesthetic_change, ['plot_width', 'plot_height', 'font_size', 'color_scheme'])
+    
+    def _on_aesthetic_change(self, event):
+        """Callback when plot aesthetic parameters change - auto-update plots"""
+        # Only update if we have data
+        if not self.dosing_events_df.empty or not self.target_od_df.empty or not self.latest_od_df.empty:
+            self._update_plots()
     
     def show_success(self, message):
         """
@@ -194,6 +275,8 @@ class PioreactorAnalysis(param.Parameterized):
             The parameter event triggering the callback
         """
         if self.file_input.value is not None and self.file_input.filename.endswith('.csv'):
+            # Show loading spinner during file processing
+            self.loading_spinner.value = True
             try:
                 # Decode the file contents
                 decoded = io.BytesIO(self.file_input.value)
@@ -239,6 +322,9 @@ class PioreactorAnalysis(param.Parameterized):
                 
                 self.show_debug(debug_info)
                 
+                # Display data preview
+                self._update_data_preview(df)
+                
                 # Update plots
                 self._update_plots()
                 
@@ -249,8 +335,12 @@ class PioreactorAnalysis(param.Parameterized):
                 tb = traceback.format_exc()
                 self.show_error(f"Error processing file: {str(e)}")
                 self.show_debug(f"Error details:\n{tb}")
+            finally:
+                # Hide loading spinner
+                self.loading_spinner.value = False
         else:
             self.show_warning("Please upload a CSV file.")
+            self.loading_spinner.value = False
     
 
     def _process_data(self, df):
@@ -513,7 +603,12 @@ class PioreactorAnalysis(param.Parameterized):
         event : param.Event
             The parameter event triggering the callback
         """
-        self._update_plots()
+        # Show spinner while updating plots
+        self.loading_spinner.value = True
+        try:
+            self._update_plots()
+        finally:
+            self.loading_spinner.value = False
     
     def _add_bookmark(self, x, y, label=None):
         """
@@ -652,7 +747,7 @@ class PioreactorAnalysis(param.Parameterized):
 
     def _update_plots(self):
         """
-        Update all plots with current data and parameters using a direct Bokeh range sharing approach.
+        Update all plots with current data and parameters using range linking.
         """
         # Check if we have data
         if self.dosing_events_df.empty or not all(col in self.dosing_events_df.columns for col in ['timestamp', 'volume']):
@@ -662,9 +757,6 @@ class PioreactorAnalysis(param.Parameterized):
             self.time_plot.object = hv.Text(0, 0, 'No valid time data found').opts(width=800, height=250)
             self.stats_output.object = "<p>No data available for plotting or statistics.</p>"
             return
-        
-        # Create a shared x-axis range using Bokeh Range1d
-        shared_x_range = Range1d()
         
         # Get a consistent reference time for time formatting
         if 'timestamp_localtime' in self.dosing_events_df.columns:
@@ -685,31 +777,52 @@ class PioreactorAnalysis(param.Parameterized):
         od_plot = self._update_od_plots() 
         time_plot = self._update_time_plots()
         
-        # Apply shared x-range and formatter to each plot if they exist
+        # Store plots for range linking
+        plots_to_link = []
+        
+        # Apply formatter to each plot if they exist and collect for linking
         if dilution_plot is not None:
-            dilution_plot = dilution_plot.opts(
-                hooks=[apply_time_formatter],
-                backend_opts={'x_range': shared_x_range}
-            )
+            dilution_plot = dilution_plot.opts(hooks=[apply_time_formatter])
+            plots_to_link.append(dilution_plot)
             self.dilution_plot.object = dilution_plot
         
         if od_plot is not None:
-            od_plot = od_plot.opts(
-                hooks=[apply_time_formatter],
-                backend_opts={'x_range': shared_x_range}
-            )
+            od_plot = od_plot.opts(hooks=[apply_time_formatter])
+            plots_to_link.append(od_plot)
             self.od_plot.object = od_plot
         
         if time_plot is not None:
-            time_plot = time_plot.opts(
-                hooks=[apply_time_formatter],
-                backend_opts={'x_range': shared_x_range}
-            )
+            time_plot = time_plot.opts(hooks=[apply_time_formatter])
+            plots_to_link.append(time_plot)
             self.time_plot.object = time_plot
+        
+        # Link the x-axis ranges of all plots
+        if len(plots_to_link) >= 2:
+            # Create RangeToolLink to sync x-axis ranges
+            for i in range(len(plots_to_link) - 1):
+                hv.plotting.links.RangeToolLink(plots_to_link[i], plots_to_link[i + 1], axes=['x'])
         
         # Update statistics
         stats_html = self._calculate_stats()
         self.stats_output.object = stats_html
+    
+    def _get_color_palette(self):
+        """Return color palette based on selected color scheme"""
+        if self.color_scheme == 'wong':
+            # Wong colorblind-friendly palette
+            return ['#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2', '#D55E00', '#CC79A7', '#000000']
+        elif self.color_scheme == 'grayscale':
+            return ['#000000', '#404040', '#808080', '#A0A0A0', '#C0C0C0', '#E0E0E0']
+        else:  # default
+            return ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
+    
+    def _get_plot_options(self):
+        """Return common plot options based on aesthetic parameters"""
+        return {
+            'width': self.plot_width,
+            'height': self.plot_height,
+            'fontsize': {'title': self.font_size + 2, 'labels': self.font_size, 'xticks': self.font_size - 1, 'yticks': self.font_size - 1}
+        }
 
     def _update_dilution_plots(self):
         """Update dilution rate and timing plots"""
@@ -771,31 +884,48 @@ class PioreactorAnalysis(param.Parameterized):
             .mean()
         )
         
-        # HoloViews plots with tooltips - using elapsed_hours for consistency
+        # Determine x-axis column and label based on time_axis_mode
+        if self.time_axis_mode == "Actual Time (datetime)":
+            x_col = 'timestamp_localtime' if 'timestamp_localtime' in self.dosing_events_df.columns else 'timestamp'
+            xlabel = 'Time (date/time)'
+        else:  # "Elapsed Time (hours)" or "Both (dual axis)"
+            x_col = 'elapsed_hours'
+            if self.time_axis_mode == "Both (dual axis)":
+                xlabel = 'Elapsed Time (hours) - Actual time shown on hover'
+            else:
+                xlabel = 'Elapsed Time (hours)'
+        
+        # Get plot options and color palette
+        plot_opts = self._get_plot_options()
+        colors = self._get_color_palette()
+        
+        # HoloViews plots with tooltips - using selected x-axis
         dilution_scatter = hv.Scatter(
             self.dosing_events_df, 
-            'elapsed_hours', 
+            x_col, 
             'instant_dilution_rate',
             label='Instant Dilution Rate'
         ).opts(
-            color='blue',
+            color=colors[0],
             size=5,
             tools=['hover'],
-            width=800,
-            height=300,
-            title='Dilution Rate'
+            width=plot_opts['width'],
+            height=plot_opts['height'],
+            title='Dilution Rate',
+            fontsize=plot_opts['fontsize']
         )
         
         dilution_line = hv.Curve(
             self.dosing_events_df, 
-            'elapsed_hours', 
+            x_col, 
             'moving_avg_dilution_rate',
             label=f'Moving Avg ({self.moving_avg_window} events)'
         ).opts(
-            color='red',
+            color=colors[1],
             line_width=2,
-            width=800,
-            height=300
+            width=plot_opts['width'],
+            height=plot_opts['height'],
+            fontsize=plot_opts['fontsize']
         )
         
         # Calculate outlier threshold for time differences
@@ -806,60 +936,63 @@ class PioreactorAnalysis(param.Parameterized):
         normal_df = self.dosing_events_df[~self.dosing_events_df['is_outlier']]
         outlier_df = self.dosing_events_df[self.dosing_events_df['is_outlier']]
         
-        # Time between doses plot - using elapsed_hours for x-axis
+        # Time between doses plot - using selected x-axis column
         time_line = hv.Curve(
             self.dosing_events_df,
-            'elapsed_hours',
+            x_col,
             'capped_time_diff',
             label='Minutes Between Doses'
         ).opts(
-            color='blue',
+            color=colors[0],
             line_width=1,
-            width=800,
-            height=250,
+            width=plot_opts['width'],
+            height=int(plot_opts['height'] * 0.625),  # Keep relative height
             title='Inter-Dosing Period',
             ylabel='Minutes Between Doses (capped at 60)',
-            tools=['hover']
+            tools=['hover'],
+            fontsize=plot_opts['fontsize']
         )
         
         normal_scatter = hv.Scatter(
             normal_df,
-            'elapsed_hours',
+            x_col,
             'capped_time_diff'
         ).opts(
-            color='blue',
+            color=colors[0],
             size=6,
             tools=['hover'],
-            width=800,
-            height=250
+            width=plot_opts['width'],
+            height=int(plot_opts['height'] * 0.625),
+            fontsize=plot_opts['fontsize']
         )
         
         outlier_scatter = hv.Scatter(
             outlier_df,
-            'elapsed_hours',
+            x_col,
             'capped_time_diff'
         ).opts(
-            color='red',
+            color=colors[3],  # Use 4th color for outliers
             marker='circle',
             size=8,
             tools=['hover'],
-            width=800,
-            height=250
+            width=plot_opts['width'],
+            height=int(plot_opts['height'] * 0.625),
+            fontsize=plot_opts['fontsize']
         )
         
         # Use the new formatting method with the start_time
         formatter = self._format_time_ticks(reference_time=start_time)
         
-        # Combine plots with the custom formatter
+        # Combine plots with the custom formatter and appropriate xlabel
         dilution_plot = (dilution_scatter * dilution_line).opts(
             legend_position='top_right',
-            xlabel='Time (elapsed hours / date)',
+            xlabel=xlabel,
             ylabel='Dilution Rate (h⁻¹)'
         )
         
         time_plot = (time_line * normal_scatter * outlier_scatter).opts(
             legend_position='top_right',
-            xlabel='Time (elapsed hours / date)',
+            xlabel=xlabel,
             ylabel='Minutes Between Doses',
             ylim=(0, 65)
         )
@@ -944,19 +1077,31 @@ class PioreactorAnalysis(param.Parameterized):
                     (self.target_od_df['od_value'] < 10)  # Assuming OD > 10 is an error
                 ]
                 
-                # Create target OD plot using elapsed_hours
+                # Determine x-axis column and label based on time_axis_mode
+                if self.time_axis_mode == "Actual Time (datetime)":
+                    x_col = 'timestamp_localtime' if 'timestamp_localtime' in self.target_od_df.columns else 'timestamp'
+                    xlabel = 'Time (date/time)'
+                else:  # "Elapsed Time (hours)" or "Both (dual axis)"
+                    x_col = 'elapsed_hours'
+                    if self.time_axis_mode == "Both (dual axis)":
+                        xlabel = 'Elapsed Time (hours) - Actual time shown on hover'
+                    else:
+                        xlabel = 'Elapsed Time (hours)'
+                
+                # Create target OD plot using selected x-axis
                 if not self.target_od_df.empty:
                     target_od = hv.Curve(
                         self.target_od_df,
-                        'elapsed_hours',  # Use elapsed_hours
+                        x_col,
                         'od_value',
                         label='Target OD'
                     ).opts(
-                        color='green',
+                        color=self._get_color_palette()[2],  # Use 3rd color
                         line_dash='dashed',
                         line_width=2,
-                        width=800,
-                        height=250
+                        width=self._get_plot_options()['width'],
+                        height=int(self._get_plot_options()['height'] * 0.625),
+                        fontsize=self._get_plot_options()['fontsize']
                     )
                     od_plots.append(target_od)
             
@@ -979,28 +1124,39 @@ class PioreactorAnalysis(param.Parameterized):
                     (self.latest_od_df['od_value'] < 10)  # Assuming OD > 10 is an error
                 ]
                 
-                # Create latest OD plot using elapsed_hours
+                # Determine x-axis column for latest OD (use same logic)
+                if self.time_axis_mode == "Actual Time (datetime)":
+                    x_col_latest = 'timestamp_localtime' if 'timestamp_localtime' in self.latest_od_df.columns else 'timestamp'
+                else:
+                    x_col_latest = 'elapsed_hours'
+                
+                # Create latest OD plot using selected x-axis
                 if not self.latest_od_df.empty:
                     latest_od = hv.Curve(
                         self.latest_od_df,
-                        'elapsed_hours',  # Use elapsed_hours
+                        x_col_latest,
                         'od_value',
                         label='Latest OD'
                     ).opts(
-                        color='blue',
+                        color=self._get_color_palette()[0],  # Use 1st color
                         line_width=2,
-                        width=800,
-                        height=250
+                        width=self._get_plot_options()['width'],
+                        height=int(self._get_plot_options()['height'] * 0.625),
+                        fontsize=self._get_plot_options()['fontsize']
                     )
                     od_plots.append(latest_od)
             
             # Create combined OD plot
             if od_plots:
+                plot_opts = self._get_plot_options()
                 od_plot = hv.Overlay(od_plots).opts(
                     legend_position='top_right',
-                    xlabel='Time (elapsed hours / date)',
+                    xlabel=xlabel,
                     ylabel='OD Value',
-                    title='OD Values'
+                    title='OD Values',
+                    width=plot_opts['width'],
+                    height=int(plot_opts['height'] * 0.625),
+                    fontsize=plot_opts['fontsize']
                 )
                 
                 # Add tap callback for OD plot
@@ -1187,8 +1343,10 @@ class PioreactorAnalysis(param.Parameterized):
               <th style="padding:8px; border:1px solid #ddd; text-align:left;">Target OD</th>
               <th style="padding:8px; border:1px solid #ddd; text-align:left;">Time Period</th>
               <th style="padding:8px; border:1px solid #ddd; text-align:left;">Avg OD</th>
+              <th style="padding:8px; border:1px solid #ddd; text-align:left;">95% CI (OD)</th>
               <th style="padding:8px; border:1px solid #ddd; text-align:left;">OD CV%</th>
               <th style="padding:8px; border:1px solid #ddd; text-align:left;">Avg Dilution (h⁻¹)</th>
+              <th style="padding:8px; border:1px solid #ddd; text-align:left;">95% CI (Dilution)</th>
               <th style="padding:8px; border:1px solid #ddd; text-align:left;">Time Between Doses (min)</th>
             </tr>
           </thead>
@@ -1196,14 +1354,28 @@ class PioreactorAnalysis(param.Parameterized):
         """
         
         for region in od_regions:
+            # Format CI for OD
+            if pd.notna(region.get('od_ci_lower')) and pd.notna(region.get('od_ci_upper')):
+                od_ci_display = f"±{(region['od_ci_upper'] - region['od_ci_lower'])/2:.4f}"
+            else:
+                od_ci_display = "N/A"
+            
+            # Format CI for dilution rate
+            if pd.notna(region.get('dilution_ci_lower')) and pd.notna(region.get('dilution_ci_upper')):
+                dilution_ci_display = f"±{(region['dilution_ci_upper'] - region['dilution_ci_lower'])/2:.4f}"
+            else:
+                dilution_ci_display = "N/A"
+            
             # Safe formatting with defaults for missing values
             html += f"""
             <tr>
               <td style="padding:8px; border:1px solid #ddd;">{region['target_od']:.3f}</td>
               <td style="padding:8px; border:1px solid #ddd;">{region['start'].strftime('%Y-%m-%d %H:%M')} to {region['end'].strftime('%Y-%m-%d %H:%M')}</td>
               <td style="padding:8px; border:1px solid #ddd;">{region.get('od_mean', 'N/A'):.3f} ± {region.get('od_std', 0):.3f}</td>
+              <td style="padding:8px; border:1px solid #ddd;">{od_ci_display}</td>
               <td style="padding:8px; border:1px solid #ddd;">{region.get('od_cv', 'N/A'):.1f}%</td>
               <td style="padding:8px; border:1px solid #ddd;">{region.get('avg_dilution_rate', 'N/A') if isinstance(region.get('avg_dilution_rate'), (int, float)) else 'N/A'}{f" ± {region.get('dilution_std', 0):.3f}" if isinstance(region.get('dilution_std'), (int, float)) else ''}</td>
+              <td style="padding:8px; border:1px solid #ddd;">{dilution_ci_display}</td>
               <td style="padding:8px; border:1px solid #ddd;">{region.get('avg_time_between_doses_min', 'N/A') if isinstance(region.get('avg_time_between_doses_min'), (int, float)) else 'N/A'}{f" ± {region.get('time_between_doses_std_min', 0):.1f}" if isinstance(region.get('time_between_doses_std_min'), (int, float)) else ''}</td>
             </tr>
             """
@@ -1215,7 +1387,494 @@ class PioreactorAnalysis(param.Parameterized):
         
         return html
     
+    def _calculate_statistics_data(self):
+        """
+        Calculate statistics for different target_od regions and return as data list.
+        
+        Returns
+        -------
+        list
+            List of dictionaries containing statistics for each region
+        """
+        if (self.target_od_df.empty or self.latest_od_df.empty or 
+            'od_value' not in self.latest_od_df.columns or
+            'od_value' not in self.target_od_df.columns):
+            return []
+        
+        # Identify regions with constant target_od
+        self.target_od_df = self.target_od_df.sort_values('timestamp')
+        od_regions = []
+        
+        # Ensure there are at least 2 target OD events to define a region
+        if len(self.target_od_df) >= 2:
+            for i in range(len(self.target_od_df) - 1):
+                start_time = self.target_od_df.iloc[i]['timestamp']
+                end_time = self.target_od_df.iloc[i+1]['timestamp']
+                target_od = self.target_od_df.iloc[i]['od_value']
+                
+                region = {
+                    'start': start_time,
+                    'end': end_time,
+                    'target_od': target_od
+                }
+                
+                # Get latest_od values in this time range
+                region_od = self.latest_od_df[(self.latest_od_df['timestamp'] >= start_time) & 
+                                             (self.latest_od_df['timestamp'] < end_time)]
+                
+                if not region_od.empty:
+                    region['od_mean'] = region_od['od_value'].mean()
+                    region['od_std'] = region_od['od_value'].std()
+                    # Handle potential division by zero in CV calculation
+                    if region['od_mean'] > 0:
+                        region['od_cv'] = variation(region_od['od_value']) * 100  # CV in percentage
+                    else:
+                        region['od_cv'] = 0
+                    
+                    # Get dosing events in this region
+                    if not self.dosing_events_df.empty:
+                        region_dosing = self.dosing_events_df[(self.dosing_events_df['timestamp'] >= start_time) & 
+                                                             (self.dosing_events_df['timestamp'] < end_time)]
+                        
+                        if len(region_dosing) > 1:
+                            region['avg_dilution_rate'] = region_dosing['instant_dilution_rate'].mean()
+                            region['dilution_std'] = region_dosing['instant_dilution_rate'].std()
+                            region['avg_time_between_doses_min'] = region_dosing['time_diff_hours'].mean() * 60
+                            region['time_between_doses_std_min'] = region_dosing['time_diff_hours'].std() * 60
+                    
+                    od_regions.append(region)
+        
+        return od_regions
+    
+    def _export_statistics_callback(self, event):
+        """Export statistics to CSV file."""
+        if (self.target_od_df.empty or self.latest_od_df.empty or 
+            'od_value' not in self.latest_od_df.columns or
+            'od_value' not in self.target_od_df.columns):
+            self.show_error("No statistics available to export. Please upload data first.")
+            return
+        
+        # Calculate statistics (reuse existing method)
+        # Identify regions with constant target_od
+        self.target_od_df = self.target_od_df.sort_values('timestamp')
+        od_regions = []
+        
+        if len(self.target_od_df) >= 2:
+            for i in range(len(self.target_od_df) - 1):
+                start_time = self.target_od_df.iloc[i]['timestamp']
+                end_time = self.target_od_df.iloc[i+1]['timestamp']
+                target_od = self.target_od_df.iloc[i]['od_value']
+                
+                region = {
+                    'start': start_time,
+                    'end': end_time,
+                    'target_od': target_od
+                }
+                
+                # Get latest_od values in this time range
+                region_od = self.latest_od_df[(self.latest_od_df['timestamp'] >= start_time) & 
+                                             (self.latest_od_df['timestamp'] < end_time)]
+                
+                if not region_od.empty:
+                    region['od_mean'] = region_od['od_value'].mean()
+                    region['od_std'] = region_od['od_value'].std()
+                    region['od_cv'] = variation(region_od['od_value']) * 100
+                    
+                    # Calculate 95% CI for OD mean
+                    from scipy import stats
+                    n_od = len(region_od)
+                    if n_od > 1:
+                        t_val = stats.t.ppf(0.975, n_od - 1)
+                        od_se = region['od_std'] / np.sqrt(n_od)
+                        region['od_ci_lower'] = region['od_mean'] - t_val * od_se
+                        region['od_ci_upper'] = region['od_mean'] + t_val * od_se
+                    else:
+                        region['od_ci_lower'] = np.nan
+                        region['od_ci_upper'] = np.nan if region['od_mean'] > 0 else 0
+                    
+                    # Get dosing events in this region
+                    if not self.dosing_events_df.empty:
+                        region_dosing = self.dosing_events_df[(self.dosing_events_df['timestamp'] >= start_time) & 
+                                                             (self.dosing_events_df['timestamp'] < end_time)]
+                        
+                        if len(region_dosing) > 1:
+                            region['avg_dilution_rate'] = region_dosing['instant_dilution_rate'].mean()
+                            region['dilution_std'] = region_dosing['instant_dilution_rate'].std()
+                            region['avg_time_between_doses_min'] = region_dosing['time_diff_hours'].mean() * 60
+                            region['time_between_doses_std_min'] = region_dosing['time_diff_hours'].std() * 60
+                            
+                            # Calculate 95% CI for dilution rate
+                            from scipy import stats
+                            n_dilution = len(region_dosing)
+                            if n_dilution > 1:
+                                t_val = stats.t.ppf(0.975, n_dilution - 1)
+                                dilution_se = region['dilution_std'] / np.sqrt(n_dilution)
+                                region['dilution_ci_lower'] = region['avg_dilution_rate'] - t_val * dilution_se
+                                region['dilution_ci_upper'] = region['avg_dilution_rate'] + t_val * dilution_se
+                            else:
+                                region['dilution_ci_lower'] = np.nan
+                                region['dilution_ci_upper'] = np.nan
+                    
+                    od_regions.append(region)
+        
+        if not od_regions:
+            self.show_error("No statistics regions found to export.")
+            return
+        
+        try:
+            # Convert to DataFrame
+            stats_df = pd.DataFrame(od_regions)
+            
+            # Format timestamps
+            stats_df['start'] = pd.to_datetime(stats_df['start']).dt.strftime('%Y-%m-%d %H:%M:%S')
+            stats_df['end'] = pd.to_datetime(stats_df['end']).dt.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Rename columns for clarity
+            stats_df.columns = ['Start Time', 'End Time', 'Target OD', 'Avg OD', 'OD Std Dev', 
+                               'OD CV%', 'Avg Dilution Rate (h⁻¹)', 'Dilution Std Dev',
+                               'Avg Time Between Doses (min)', 'Time Between Doses Std Dev (min)']
+            
+            # Generate filename with timestamp
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"dilution_rate_statistics_{timestamp}.csv"
+            
+            # Save to CSV
+            stats_df.to_csv(filename, index=False)
+            
+            self.show_success(f"Statistics exported to {filename}")
+        except Exception as e:
+            self.show_error(f"Failed to export statistics: {str(e)}")
+    
+    def _export_dilution_plot_callback(self, event):
+        """Export dilution rate plot to PNG file."""
+        if self.dilution_plot.object is None or str(self.dilution_plot.object) == 'Text':
+            self.show_error("No dilution rate plot to export. Please upload data first.")
+            return
+        
+        try:
+            from datetime import datetime
+            import holoviews as hv
+            
+            # Generate filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"dilution_rate_plot_{timestamp}.png"
+            
+            # Save plot using HoloViews save function with DPI
+            hv.save(self.dilution_plot.object, filename, fmt='png', dpi=self.plot_dpi)
+            
+            self.show_success(f"Dilution rate plot exported to {filename} at {self.plot_dpi} DPI")
+        except Exception as e:
+            self.show_error(f"Failed to export plot: {str(e)}")
+    
+    def _export_od_plot_callback(self, event):
+        """Export OD plot to PNG file."""
+        if self.od_plot.object is None or str(self.od_plot.object) == 'Text':
+            self.show_error("No OD plot to export. Please upload data first.")
+            return
+        
+        try:
+            from datetime import datetime
+            import holoviews as hv
+            
+            # Generate filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"od_plot_{timestamp}.png"
+            
+            # Save plot using HoloViews save function with DPI
+            hv.save(self.od_plot.object, filename, fmt='png', dpi=self.plot_dpi)
+            
+            self.show_success(f"OD plot exported to {filename} at {self.plot_dpi} DPI")
+        except Exception as e:
+            self.show_error(f"Failed to export plot: {str(e)}")
+    
+    def _export_time_plot_callback(self, event):
+        """Export time between doses plot to PNG file."""
+        if self.time_plot.object is None or str(self.time_plot.object) == 'Text':
+            self.show_error("No time plot to export. Please upload data first.")
+            return
+        
+        try:
+            from datetime import datetime
+            import holoviews as hv
+            
+            # Generate filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"time_between_doses_plot_{timestamp}.png"
+            
+            # Save plot using HoloViews save function with DPI
+            hv.save(self.time_plot.object, filename, fmt='png', dpi=self.plot_dpi)
+            
+            self.show_success(f"Time between doses plot exported to {filename} at {self.plot_dpi} DPI")
+        except Exception as e:
+            self.show_error(f"Failed to export plot: {str(e)}")
+    
+    def _export_all_callback(self, event):
+        """Export all plots and data to a timestamped folder."""
+        import os
+        from datetime import datetime
+        
+        try:
+            # Create timestamped export directory
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            export_dir = f"dilution_analysis_export_{timestamp}"
+            os.makedirs(export_dir, exist_ok=True)
+            
+            export_count = 0
+            
+            # Export dilution rate plot if available
+            if self.dilution_plot.object is not None and str(self.dilution_plot.object) != 'Text':
+                try:
+                    import holoviews as hv
+                    dilution_filename = os.path.join(export_dir, "dilution_rate_plot.png")
+                    hv.save(self.dilution_plot.object, dilution_filename, fmt='png', dpi=self.plot_dpi)
+                    export_count += 1
+                except Exception as e:
+                    self.show_debug(f"Dilution plot export failed: {str(e)}")
+            
+            # Export OD plot if available
+            if self.od_plot.object is not None and str(self.od_plot.object) != 'Text':
+                try:
+                    import holoviews as hv
+                    od_filename = os.path.join(export_dir, "od_plot.png")
+                    hv.save(self.od_plot.object, od_filename, fmt='png', dpi=self.plot_dpi)
+                    export_count += 1
+                except Exception as e:
+                    self.show_debug(f"OD plot export failed: {str(e)}")
+            
+            # Export time plot if available
+            if self.time_plot.object is not None and str(self.time_plot.object) != 'Text':
+                try:
+                    import holoviews as hv
+                    time_filename = os.path.join(export_dir, "time_between_doses_plot.png")
+                    hv.save(self.time_plot.object, time_filename, fmt='png', dpi=self.plot_dpi)
+                    export_count += 1
+                except Exception as e:
+                    self.show_debug(f"Time plot export failed: {str(e)}")
+            
+            # Export statistics if available
+            if (not self.target_od_df.empty or not self.latest_od_df.empty) and not self.dosing_events_df.empty:
+                try:
+                    # Reuse statistics calculation logic
+                    stats_data = self._calculate_statistics_data()
+                    if stats_data:
+                        stats_df = pd.DataFrame(stats_data)
+                        stats_filename = os.path.join(export_dir, "statistics.csv")
+                        stats_df.to_csv(stats_filename, index=False)
+                        export_count += 1
+                except Exception as e:
+                    self.show_debug(f"Statistics export failed: {str(e)}")
+            
+            # Export raw dosing events data if available
+            if not self.dosing_events_df.empty:
+                dosing_filename = os.path.join(export_dir, "dosing_events.csv")
+                self.dosing_events_df.to_csv(dosing_filename, index=False)
+                export_count += 1
+            
+            # Export OD data if available
+            if not self.target_od_df.empty:
+                target_od_filename = os.path.join(export_dir, "target_od.csv")
+                self.target_od_df.to_csv(target_od_filename, index=False)
+                export_count += 1
+            
+            if not self.latest_od_df.empty:
+                latest_od_filename = os.path.join(export_dir, "latest_od.csv")
+                self.latest_od_df.to_csv(latest_od_filename, index=False)
+                export_count += 1
+            
+            if export_count > 0:
+                self.show_success(f"Exported {export_count} items to folder: {export_dir}")
+            else:
+                self.show_error("No data available to export. Please upload data first.")
+                
+        except Exception as e:
+            self.show_error(f"Failed to export all: {str(e)}")
+            self.show_debug(f"Export all error: {str(e)}")
+    
+    def _update_data_preview(self, raw_df: pd.DataFrame | None = None):
+        """Create and display a preview of the uploaded data.
+
+        Parameters
+        ----------
+        raw_df : pd.DataFrame | None
+            If provided, use this raw dataframe for the first-10-rows table; otherwise derive from
+            the internal dataframes (dosing_events_df/target_od_df/latest_od_df).
+        """
+        try:
+            preview_df = None
+            if raw_df is not None and isinstance(raw_df, pd.DataFrame) and not raw_df.empty:
+                preview_df = raw_df.copy()
+            elif hasattr(self, 'dosing_events_df') and isinstance(self.dosing_events_df, pd.DataFrame) and not self.dosing_events_df.empty:
+                preview_df = self.dosing_events_df.copy()
+            elif hasattr(self, 'latest_od_df') and isinstance(self.latest_od_df, pd.DataFrame) and not self.latest_od_df.empty:
+                preview_df = self.latest_od_df.copy()
+            elif hasattr(self, 'target_od_df') and isinstance(self.target_od_df, pd.DataFrame) and not self.target_od_df.empty:
+                preview_df = self.target_od_df.copy()
+
+            if preview_df is None or preview_df.empty:
+                self.data_preview.object = ""
+                return
+
+            total_rows = len(preview_df)
+            cols = list(preview_df.columns)
+
+            # Time / OD stats when possible
+            time_range = "N/A"
+            if 'elapsed_hours' in preview_df.columns:
+                tmin = pd.to_numeric(preview_df['elapsed_hours'], errors='coerce').min()
+                tmax = pd.to_numeric(preview_df['elapsed_hours'], errors='coerce').max()
+                if pd.notna(tmin) and pd.notna(tmax):
+                    time_range = f"{tmin:.2f}h - {tmax:.2f}h ({(tmax - tmin):.2f}h)"
+
+            od_range = "N/A"
+            od_col = next((c for c in ['od_reading', 'od_value', 'od'] if c in preview_df.columns), None)
+            if od_col is not None:
+                series = pd.to_numeric(preview_df[od_col], errors='coerce')
+                if not series.empty:
+                    omin = series.min()
+                    omax = series.max()
+                    omean = series.mean()
+                    if pd.notna(omin) and pd.notna(omax) and pd.notna(omean):
+                        od_range = f"{omin:.4f} - {omax:.4f} (mean: {omean:.4f})"
+
+            # Build HTML
+            def _float_fmt(x):
+                try:
+                    if isinstance(x, (int, float)):
+                        return f"{x:.4f}" if abs(float(x)) < 1000 else f"{x:.2f}"
+                    return f"{x}"
+                except Exception:
+                    return f"{x}"
+
+            html = f"""
+            <div style=\"border: 1px solid #ddd; border-radius: 5px; padding: 15px; margin: 10px 0; background-color: #f9f9f9;\">
+                <h3 style=\"margin-top:0; color: #333;\">📊 Data Preview</h3>
+                <div style=\"margin-bottom: 15px;\">
+                    <strong>Summary:</strong>
+                    <ul style=\"margin: 5px 0;\">
+                        <li>Total Rows: {total_rows}</li>
+                        <li>Columns ({len(cols)}): {', '.join(cols)}</li>
+                        <li>Time Range: {time_range}</li>
+                        <li>OD Range: {od_range}</li>
+                    </ul>
+                </div>
+                <strong>First 10 Rows:</strong>
+                <div style=\"overflow-x: auto; margin-top: 10px;\">
+                    {preview_df.head(10).to_html(index=False, border=1, classes='dataframe',
+                        float_format=_float_fmt)}
+                </div>
+            </div>
+            """
+
+            self.data_preview.object = html
+        except Exception as e:
+            self.data_preview.object = f"<div style='color:#b00;'>Preview error: {str(e)}</div>"
+    
+    def save_session_callback(self, event=None):
+        """Save the current session state to a JSON file."""
+        import json
+        from datetime import datetime
+        
+        try:
+            # Create session state dictionary
+            session_state = {
+                'timestamp': datetime.now().isoformat(),
+                'parameters': {
+                    'reactor_volume': self.reactor_volume,
+                    'moving_avg_window': self.moving_avg_window,
+                    'time_axis_mode': self.time_axis_mode,
+                    'plot_width': self.plot_width,
+                    'plot_height': self.plot_height,
+                    'font_size': self.font_size,
+                    'color_scheme': self.color_scheme,
+                    'plot_dpi': self.plot_dpi,
+                },
+                'data': {
+                    'dosing_events': self.dosing_events_df.to_json(orient='split', date_format='iso') if not self.dosing_events_df.empty else None,
+                    'target_od': self.target_od_df.to_json(orient='split', date_format='iso') if not self.target_od_df.empty else None,
+                    'latest_od': self.latest_od_df.to_json(orient='split', date_format='iso') if not self.latest_od_df.empty else None,
+                },
+                'bookmarks': self.bookmarks,
+            }
+            
+            # Save to file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f'dilution_session_{timestamp}.json'
+            
+            with open(filename, 'w') as f:
+                json.dump(session_state, f, indent=2)
+            
+            self.show_success(f"Session saved successfully to {filename}")
+            
+        except Exception as e:
+            self.show_error(f"Error saving session: {str(e)}")
+            import traceback
+            self.show_debug(f"Save error: {traceback.format_exc()}")
+    
+    def load_session_callback(self, event):
+        """Load session state from a JSON file."""
+        import json
+        
+        if not event.new:
+            return
+        
+        self.loading_spinner.value = True
+        
+        try:
+            # Read the uploaded file
+            file_obj = event.new[0] if isinstance(event.new, list) else event.new
+            content = file_obj.decode('utf-8') if isinstance(file_obj, bytes) else file_obj
+            
+            session_state = json.loads(content)
+            
+            # Restore parameters
+            params = session_state.get('parameters', {})
+            self.reactor_volume = params.get('reactor_volume', 14.0)
+            self.moving_avg_window = params.get('moving_avg_window', 30)
+            self.time_axis_mode = params.get('time_axis_mode', 'Elapsed Time (hours)')
+            self.plot_width = params.get('plot_width', 1200)
+            self.plot_height = params.get('plot_height', 400)
+            self.font_size = params.get('font_size', 12)
+            self.color_scheme = params.get('color_scheme', 'default')
+            self.plot_dpi = params.get('plot_dpi', 150)
+            
+            # Restore data
+            data = session_state.get('data', {})
+            if data.get('dosing_events'):
+                self.dosing_events_df = pd.read_json(io.StringIO(data['dosing_events']), orient='split')
+            else:
+                self.dosing_events_df = pd.DataFrame()
+            
+            if data.get('target_od'):
+                self.target_od_df = pd.read_json(io.StringIO(data['target_od']), orient='split')
+            else:
+                self.target_od_df = pd.DataFrame()
+            
+            if data.get('latest_od'):
+                self.latest_od_df = pd.read_json(io.StringIO(data['latest_od']), orient='split')
+            else:
+                self.latest_od_df = pd.DataFrame()
+            
+            # Restore bookmarks
+            self.bookmarks = session_state.get('bookmarks', [])
+            self._update_bookmarks_container()
+            
+            # Update plots
+            self._update_plots()
+            
+            timestamp = session_state.get('timestamp', 'unknown')
+            self.show_success(f"Session loaded successfully (saved: {timestamp})")
+            
+        except Exception as e:
+            self.show_error(f"Error loading session: {str(e)}")
+            import traceback
+            self.show_debug(f"Load error: {traceback.format_exc()}")
+        
+        finally:
+            self.loading_spinner.value = False
+
     def view(self):
+        
         """
         Return the main layout for display.
         

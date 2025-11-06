@@ -25,7 +25,38 @@ An interactive web application for analyzing bioreactor dilution rates from Pior
 
 This application is deployed on [Hugging Face Spaces](https://huggingface.co/spaces) and can be accessed at: [huggingface.co/spaces/DocRuzzy/pioreactor_analysis_panel](https://huggingface.co/spaces/DocRuzzy/pioreactor_analysis_panel)
 
+## Installation & Setup
+
+### 🚀 Quick Start (Windows)
+
+The easiest way to get started:
+
+1. **Double-click** `install.bat` (installs everything automatically)
+2. **Double-click** `launch.bat` (starts the application)
+3. Browser opens to `http://localhost:7860`
+
+**See [QUICKSTART.md](QUICKSTART.md) for the fastest way to get started!**
+
+### 📦 Multiple Installation Options
+
+We provide several installation methods to suit your needs:
+
+- **Automated Installer** (Windows) - Double-click `install.bat`
+- **Standalone EXE** - No Python required (run `build_exe.bat`)
+- **Python Package** - `pip install -e .` for system-wide installation
+- **Manual Setup** - Traditional virtual environment approach
+
+**See [INSTALL.md](INSTALL.md) for detailed installation instructions for all platforms.**
+
 ## Local Development
+
+### Quick Method (Windows)
+```batch
+install.bat
+launch.bat
+```
+
+### Manual Method (All Platforms)
 
 To run this application locally:
 

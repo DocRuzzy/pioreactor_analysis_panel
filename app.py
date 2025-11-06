@@ -68,9 +68,24 @@ app = pn.template.FastListTemplate(
 # Make the template servable
 app.servable()
 
-# For Hugging Face Spaces
-if __name__ == "__main__":
+def main():
+    """Main entry point for command-line execution"""
     port = int(os.environ.get("PORT", 7860))
-    address = "0.0.0.0"
+    address = os.environ.get("ADDRESS", "0.0.0.0")
+    show_browser = os.environ.get("SHOW_BROWSER", "true").lower() == "true"
+    
     logger.info(f"Starting Panel server on {address}:{port}")
-    pn.serve(app, port=port, address=address, allow_websocket_origin=["*"], show=False)
+    logger.info(f"Open your browser to: http://localhost:{port}")
+    
+    pn.serve(
+        app, 
+        port=port, 
+        address=address, 
+        allow_websocket_origin=["*"], 
+        show=show_browser,
+        title="Pioreactor Analysis Panel"
+    )
+
+# For Hugging Face Spaces and direct execution
+if __name__ == "__main__":
+    main()
