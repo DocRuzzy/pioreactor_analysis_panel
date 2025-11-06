@@ -18,6 +18,9 @@ hidden_imports = [
     'bokeh.plotting',
     'bokeh.models.formatters',
     'pandas',
+    'pandas._libs',
+    'pandas._libs.tslibs',
+    'pandas._libs.tslibs.base',
     'numpy',
     'scipy',
     'scipy.stats',
@@ -30,6 +33,8 @@ hidden_imports = [
     'yaml',
     'markdown',
     'requests',
+    'pkg_resources',
+    'pkg_resources.py2_warn',
 ]
 
 a = Analysis(
@@ -38,7 +43,7 @@ a = Analysis(
     binaries=[],
     datas=added_files,
     hiddenimports=hidden_imports,
-    hookspath=[],
+    hookspath=['pyinstaller_hooks'],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],

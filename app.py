@@ -97,12 +97,23 @@ def main():
     logger.info(f"Starting Panel server on {address}:{port}")
     logger.info(f"Open your browser to: http://localhost:{port}")
     
+    # Custom browser opener that uses localhost instead of 0.0.0.0
+    if show_browser:
+        import webbrowser
+        import threading
+        def open_browser():
+            import time
+            time.sleep(1.5)  # Wait for server to start
+            webbrowser.open(f"http://localhost:{port}")
+        
+        threading.Thread(target=open_browser, daemon=True).start()
+    
     pn.serve(
         app, 
         port=port, 
         address=address, 
         allow_websocket_origin=["*"], 
-        show=show_browser,
+        show=False,  # We handle browser opening manually above
         title="Pioreactor Analysis Panel"
     )
 
