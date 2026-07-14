@@ -21,9 +21,6 @@ An interactive web application for analyzing bioreactor dilution rates from Pior
 - Bookmark system for marking important points
 - CSV data upload capability
 
-## Deployment
-
-This application is deployed on [Hugging Face Spaces](https://huggingface.co/spaces) and can be accessed at: [huggingface.co/spaces/DocRuzzy/pioreactor_analysis_panel](https://huggingface.co/spaces/DocRuzzy/pioreactor_analysis_panel)
 
 ## Local Development
 
